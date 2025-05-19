@@ -17,6 +17,9 @@ importers:
       pinia:
         specifier: ^3.0.2
         version: 3.0.2(typescript@5.8.3)(vue@3.5.14(typescript@5.8.3))
+      test:
+        specifier: 'file:'
+        version: file:(typescript@5.8.3)
       vue:
         specifier: ^3.5.13
         version: 3.5.14(typescript@5.8.3)
@@ -1183,6 +1186,7 @@ snapshots:
 
   test@file:(typescript@5.8.3):
     dependencies:
+      '@ocean/common': 0.0.2(typescript@5.8.3)
       element-plus: 2.9.10(vue@3.5.14(typescript@5.8.3))
       pinia: 3.0.2(typescript@5.8.3)(vue@3.5.14(typescript@5.8.3))
       vue: 3.5.14(typescript@5.8.3)
