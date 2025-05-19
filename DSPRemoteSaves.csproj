@@ -165,9 +165,6 @@
     <Error Condition="!Exists('packages\System.ValueTuple.4.6.1\build\net471\System.ValueTuple.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\System.ValueTuple.4.6.1\build\net471\System.ValueTuple.targets'))" />
   </Target>
   <PropertyGroup>
-    <PostBuildEvent>
-
-copy "$(TargetPath)" "C:\Users\Administrator\AppData\Roaming\r2modmanPlus-local\DysonSphereProgram\profiles\testDefinMod\BepInEx\plugins\$(ProjectName)\$(TargetFileName)"
-</PostBuildEvent>
+    <PostBuildEvent></PostBuildEvent>
   </PropertyGroup>
 </Project>
