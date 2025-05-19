@@ -1,0 +1,28 @@
+{
+  "name": "test",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@ocean/common": "^0.0.2",
+    "element-plus": "^2.9.10",
+    "pinia": "^3.0.2",
+    "test": "file:",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.1",
+    "whatwg-fetch": "^3.6.20"
+  },
+  "devDependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "@vitejs/plugin-vue": "^5.2.3",
+    "@vue/tsconfig": "^0.7.0",
+    "typescript": "~5.8.3",
+    "vite": "^6.3.5",
+    "vue-tsc": "^2.2.8"
+  }
+}
