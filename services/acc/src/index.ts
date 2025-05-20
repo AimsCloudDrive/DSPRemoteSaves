@@ -13,7 +13,7 @@ function assert(condition: unknown, message: string = ""): asserts condition {
 
 class CodeResult<
   C extends number = number,
-  Payload extends { [K in string]: any } = {},
+  Payload extends { [K in string]: any } = {}
 > {
   declare code: C;
   declare message: string | undefined;
@@ -342,9 +342,12 @@ const complete_upload: Handler = (users) => {
             new CodeResult(1, "上传未完成", {
               nots: new Array(upload.totalChunks)
                 .fill(null)
-                .reduce<
-                  number[]
-                >((nots, _, index) => (!upload.uploadedChunks.has(index) && nots.push(index), nots), []),
+                .reduce<number[]>(
+                  (nots, _, index) => (
+                    !upload.uploadedChunks.has(index) && nots.push(index), nots
+                  ),
+                  []
+                ),
             })
           );
           return;
@@ -401,13 +404,11 @@ const file_list: Handler = (users) => {
     handlers: [
       async (request, response) => {
         const { userName, password } = request.body;
-        console.log("file-list-1", userName, password);
         if (!userName || !password) {
           response.status(400);
           response.send({ code: 1, message: "用户名或密码不能为空" });
           return;
         }
-        console.log("file-list-2", userName, password);
         // 检查用户是否存在
         const checked = await checkUser(users, { userName, password });
         if (checked.code !== 0) {
@@ -415,7 +416,6 @@ const file_list: Handler = (users) => {
           response.status(400).json(checked);
           return;
         }
-        console.log("file-list-3", userName, password);
         const savepath = path.resolve(
           baseSavePath,
           "users",
@@ -437,9 +437,7 @@ const file_list: Handler = (users) => {
             };
           }
         );
-        console.log("file-list-4", userName, password);
         response.status(200).send(new CodeResult(0, { files }));
-        console.log("file-list-5", userName, password);
       },
     ],
     method: "post",
