@@ -112,6 +112,7 @@ namespace DSPRemoteSaves
         {
             if (!CheckConfig()) return;
             Debug.Log("OnGameEnd");
+            return;
 
             // 同步执行上传任务（带超时机制）
             var uploadTask = Task.Run(() => UploadSaves());

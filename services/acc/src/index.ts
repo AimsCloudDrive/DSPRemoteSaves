@@ -520,12 +520,13 @@ const download: Handler = (users) => {
             response.writeHead(200, {
               "Content-Length": fileSize,
               "Content-Type": "application/octet-stream",
-              "Content-Disposition": `attachment; filename="${fileName}"`,
+              "Content-Disposition": `attachment; filename=""`,
             });
 
             fs.createReadStream(filePath).pipe(response);
           }
         } catch (error) {
+          console.log(error);
           response.status(500).json(new CodeResult(1, "文件下载失败"));
         }
       },
