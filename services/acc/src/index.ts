@@ -293,13 +293,14 @@ const upload_chunk: Handler = (users) => {
         request
           .pipe(writeStream)
           .on("finish", async () => {
+            writeStream.close();
             upload.uploadedChunks.add(chunkIndex);
             const checked = await checkUser(users, upload, false);
             if (checked.code !== 0) {
               throw new Error();
             }
             const { cancelClearId, ..._upload } = upload;
-            users.updateOne(
+            await users.updateOne(
               {
                 userName: { $eq: upload.userName },
               },
@@ -317,13 +318,14 @@ const upload_chunk: Handler = (users) => {
             );
             response.status(200).json(new CodeResult(0));
           })
-          .on("error", (e) =>
+          .on("error", (e) => {
+            writeStream.close();
             response.status(500).json(
               new CodeResult(1, "分片保存失败", {
                 error: { name: e.name, message: e.message },
               })
-            )
-          );
+            );
+          });
       },
     ],
   };
@@ -403,7 +405,7 @@ const file_list: Handler = (users) => {
     path: "/file-list",
     handlers: [
       async (request, response) => {
-        const { userName, password } = request.body;
+        const { userName, password, syncFileExtensions = [] } = request.body;
         if (!userName || !password) {
           response.status(400);
           response.send({ code: 1, message: "用户名或密码不能为空" });
@@ -428,15 +430,24 @@ const file_list: Handler = (users) => {
           created = true;
         }
 
-        const files = (created ? [] : fs.readdirSync(savepath)).map(
-          (fileName) => {
+        const extensions = new Set<string>(
+          (Array.isArray(syncFileExtensions)
+            ? syncFileExtensions
+            : String(syncFileExtensions).split(",")
+          ).map((ext) => ext.trim().toLowerCase())
+        );
+        extensions.forEach((e) => console.log(e));
+        const files = (created ? [] : fs.readdirSync(savepath))
+          .filter((fileName) =>
+            extensions.has(path.extname(fileName).toLowerCase())
+          )
+          .map((fileName) => {
             const stats = fs.statSync(path.resolve(savepath, fileName));
             return {
               fileName,
               fileSize: stats.size,
             };
-          }
-        );
+          });
         response.status(200).send(new CodeResult(0, { files }));
       },
     ],
@@ -683,7 +694,7 @@ const login_user: Handler = (users) => {
             { userName: { $eq: userName } },
             { $set: { login: true } }
           );
-          if (result.modifiedCount > 0) {
+          if (result.matchedCount > 0) {
             response.status(200).json(new CodeResult(0, "登录成功"));
           } else {
             response.status(500).send(new CodeResult(0, "登录失败"));

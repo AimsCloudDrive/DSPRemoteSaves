@@ -26,6 +26,7 @@ namespace DSPRemoteSaves
         public const string VERSION = "1.0.0";
         public const string GAME_PROCESS = "DSPGAME.exe";
 
+        #region Config Settings
         private ConfigEntry<string> configServerURL;
         private ConfigEntry<string> configUsername;
         private ConfigEntry<string> configPassword;
@@ -36,7 +37,12 @@ namespace DSPRemoteSaves
         private ConfigEntry<int> configMaxParallelDownloadCount;
         private ConfigEntry<int> configMaxParallelUploadCount;
         private ConfigEntry<int> configMaxChunkParallelUploadCount;
+        private ConfigEntry<int> configCheckInterval;
+        #endregion Config Settings
+
         private HttpClient httpClient;
+        private ConcurrentDictionary<string, DateTime> _fileLastWriteTimes = new ConcurrentDictionary<string, DateTime>();
+        private CancellationTokenSource _loopCts;
 
         public void Awake()
         {
@@ -44,10 +50,11 @@ namespace DSPRemoteSaves
             {
                 // 配置初始化
                 InitConfig();
-                // 网络客户端初始化
-                if (!CheckConfig()) {
+                if (!CheckConfig())
+                {
                     return;
                 }
+                // 网络客户端初始化
                 httpClient = new HttpClient
                 {
                     Timeout = TimeSpan.FromSeconds(30),
@@ -66,22 +73,29 @@ namespace DSPRemoteSaves
 
         private void InitConfig()
         {
-            configEnabled = Config.Bind("General", "Enabled", true, "Enable mod");
+            configEnabled = Config.Bind("General", "Enabled", true, new ConfigDescription("启用远程存档同步功能"));
 
             configServerURL = Config.Bind("Server", "Remote ServerURL", "",
-                "Remote server address (e.g. http://example.com:9999)");
+                new ConfigDescription("远程服务器地址（示例：http://example.com:9999）"));
 
-            configUsername = Config.Bind("User", "Username", "", "Remote UserName");
-            configPassword = Config.Bind("User", "Password", "", "Remote password");
+            configUsername = Config.Bind("User", "Username", "", new ConfigDescription("远程服务器用户名"));
+            configPassword = Config.Bind("User", "Password", "", new ConfigDescription("远程服务器密码"));
 
-            configDownloadAll = Config.Bind("Performance", "DownloadAll", false,
-                "是否下载云端全部存档（true：全覆盖，false：仅下载本地没有的）");
-            configFileExtensions = Config.Bind("Performance", "FileExtensions", ".dsv,.moddsv,.server",
-                "上传文件的拓展名(用英文逗号分割)");
-            configMaxParallelUploadCount = Config.Bind("Performance", "MaxParallelUploadCount", 3, new ConfigDescription("上传时最大文件并发数", new AcceptableValueRange<int>(1, 3)));
-            configChunkSize = Config.Bind("Performance", "ChunkSize(MB)", 5, new ConfigDescription("上传时每个分片大小（单位：MB）", new AcceptableValueRange<int>(5, 50)));
-            configMaxChunkParallelUploadCount = Config.Bind("Performance", "MaxChunkParallelUploadCount", 5, new ConfigDescription("上传分片时最大并发分片数", new AcceptableValueRange<int>(1, 10)));
-            configMaxParallelDownloadCount = Config.Bind("Performance", "MaxParallelDownloadCount", 5, new ConfigDescription("下载时最大并发下载数", new AcceptableValueRange<int>(1, 10)));
+            configDownloadAll = Config.Bind("Performance", "ForceDownloadAll", false,
+                 new ConfigDescription("同步策略：true 表示用云端存档完全覆盖本地，false 表示仅下载本地缺失的存档"));
+            configFileExtensions = Config.Bind("Performance", "SyncFileExtensions", ".dsv,.moddsv,.server",
+                new ConfigDescription("需要同步的文件扩展名列表（使用英文逗号分隔）"));
+            configMaxParallelUploadCount = Config.Bind("Performance", "MaxParallelUploadCount", 3,
+                new ConfigDescription("单个文件上传时的最大并行任务数", new AcceptableValueRange<int>(1, 3)));
+            configChunkSize = Config.Bind("Performance", "ChunkSize(MB)", 5,
+                new ConfigDescription("大文件分块上传时每个分块的大小（单位：MB）", new AcceptableValueRange<int>(5, 50)));
+            configMaxChunkParallelUploadCount = Config.Bind("Performance", "MaxChunkParallelUploadCount", 5,
+                new ConfigDescription("单个文件分块上传时的最大并行分块数", new AcceptableValueRange<int>(1, 10)));
+            configMaxParallelDownloadCount = Config.Bind("Performance", "MaxParallelDownloadCount", 5,
+                new ConfigDescription("从服务器下载存档时的最大并行任务数", new AcceptableValueRange<int>(1, 10)));
+            configCheckInterval = Config.Bind("Performance", "CheckInterval(s)", 5 * 60,
+                new ConfigDescription("本地存档变更检测间隔（单位：秒）", new AcceptableValueRange<int>(1 * 60, 15 * 60)));
+
             Config.Save();
         }
 
@@ -92,10 +106,14 @@ namespace DSPRemoteSaves
             if (!CheckConfig()) return;
             Debug.Log("OnGameStart");
             // 同步执行下载任务（带超时机制）
-            var uploadTask = Task.Run(() => DownloadSaves());
+            var downloadTask = Task.Run(() => DownloadSaves());
             try
             {
-                uploadTask.Wait(TimeSpan.FromSeconds(30)); // 最多等待30秒
+                Boolean success = downloadTask.Wait(TimeSpan.FromSeconds(30)); // 最多等待30秒
+                if (success)
+                {
+                    Task.Run(() => RequestLoop());
+                }
             }
             catch (AggregateException ae)
             {
@@ -106,27 +124,118 @@ namespace DSPRemoteSaves
             }
         }
 
+        private async Task RequestLoop()
+        {
+            _loopCts = new CancellationTokenSource();
+            var savePath = GetSavePath();
+            var extensions = GetFileExtensions();
+            try
+            {
+                // 初始化文件快照
+                if (!UpdateFileSnapshot(savePath, extensions))
+                {
+                    return;
+                }
+
+                while (!_loopCts.IsCancellationRequested)
+                {
+                    await Task.Delay(configCheckInterval.Value * 1000, _loopCts.Token);
+
+                    // 1. 检测文件变更
+                    var changedFiles = GetChangedFiles(savePath, extensions);
+                    if (changedFiles.Count == 0) continue;
+
+                    Debug.Log($"检测到 {changedFiles.Count} 个文件变更，开始同步...");
+
+                    // 2. 并行上传变更文件
+                    var semaphore = new SemaphoreSlim(configMaxParallelUploadCount.Value);
+                    var uploadTasks = changedFiles.Select(async filePath =>
+                    {
+                        await semaphore.WaitAsync(_loopCts.Token);
+                        try
+                        {
+                            await UploadSingleFile(filePath);
+                            // 更新记录时间为当前时间
+                            var newLastWrite = File.GetLastWriteTimeUtc(filePath);
+                            var fileName = Path.GetFileName(filePath);
+                            _fileLastWriteTimes.AddOrUpdate(fileName, newLastWrite, (k, v) => newLastWrite);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogError($"文件同步失败 [{Path.GetFileName(filePath)}]: {FormatException(ex)}");
+                        }
+                        finally
+                        {
+                            semaphore.Release();
+                        }
+                    });
+
+                    await Task.WhenAll(uploadTasks);
+                }
+            }
+            catch (TaskCanceledException)
+            {
+                // 正常退出
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"同步循环异常: {FormatException(ex)}");
+            }
+        }
+
+        private bool UpdateFileSnapshot(string savePath, IEnumerable<string> extensions)
+        {
+            if (!Directory.Exists(savePath)) return false;
+
+            foreach (var filePath in Directory.GetFiles(savePath))
+            {
+                if (!ShouldProcessFile(filePath, extensions)) continue;
+
+                var fileName = Path.GetFileName(filePath);
+                var lastWrite = File.GetLastWriteTimeUtc(filePath);
+                _fileLastWriteTimes[fileName] = lastWrite;
+            }
+            return true;
+        }
+
+        private List<string> GetChangedFiles(string savePath, IEnumerable<string> extensions)
+        {
+            var changedFiles = new List<string>();
+            if (!Directory.Exists(savePath)) return changedFiles;
+
+            foreach (var filePath in Directory.GetFiles(savePath))
+            {
+                try
+                {
+                    if (!ShouldProcessFile(filePath, extensions)) continue;
+
+                    var fileName = Path.GetFileName(filePath);
+                    var currentLastWrite = File.GetLastWriteTimeUtc(filePath);
+
+                    // 检测到以下情况需要同步：
+                    // 1. 新文件（字典中不存在记录）
+                    // 2. 最后修改时间发生变化
+                    if (!_fileLastWriteTimes.TryGetValue(fileName, out var lastWrite) ||
+                        currentLastWrite > lastWrite)
+                    {
+                        changedFiles.Add(filePath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"文件访问异常 [{filePath}]: {ex.Message}");
+                }
+            }
+            return changedFiles;
+        }
+
         //[HarmonyPostfix]
         //[HarmonyPatch(typeof(GameMain), "End")]
         public void OnDestroy()
         {
             if (!CheckConfig()) return;
+            _loopCts?.Cancel();
             Debug.Log("OnGameEnd");
-            return;
-
-            // 同步执行上传任务（带超时机制）
-            var uploadTask = Task.Run(() => UploadSaves());
-            try
-            {
-                uploadTask.Wait(TimeSpan.FromSeconds(30)); // 最多等待30秒
-            }
-            catch (AggregateException ae)
-            {
-                foreach (var e in ae.InnerExceptions)
-                {
-                    Debug.LogError($"上传终止: {FormatException(e)}");
-                }
-            }
         }
 
         private bool CheckConfig()
@@ -176,6 +285,12 @@ namespace DSPRemoteSaves
             [JsonProperty("password")]
             public string Password { get; set; }
         }
+        public class FileListRequest : AuthRequest {
+            [JsonProperty("syncFileExtensions")]
+            public List<string> SyncFileExtensions { get; set; } = new List<string>();
+        
+        }
+
         public class UploadInitRequest : AuthRequest
         {
             [JsonProperty("fileName")]
@@ -288,7 +403,6 @@ namespace DSPRemoteSaves
             {
                 // 获取远程文件列表
                 var remoteFiles = await GetRemoteFileList();
-                Debug.Log("GetRemoteFileList" + new CustomJsonSerializer().Serialize(remoteFiles));
                 if (remoteFiles == null || remoteFiles.Count == 0)
                 {
                     Debug.Log("服务器没有可用的存档文件");
@@ -297,7 +411,6 @@ namespace DSPRemoteSaves
 
                 // 获取本地文件索引（文件名不区分大小写）
                 var localFiles = GetLocalFileIndex();
-                Debug.Log("GetLocalFileIndex");
                 // 根据配置策略筛选需要下载的文件
                 var filesToDownload = remoteFiles.Where(remoteFile =>
                     ShouldDownloadFile(remoteFile.FileName, localFiles)
@@ -437,10 +550,11 @@ namespace DSPRemoteSaves
         {
             try
             {
-                var payload = new AuthRequest
+                var payload = new FileListRequest
                 {
                     UserName = configUsername.Value,
-                    Password = configPassword.Value
+                    Password = configPassword.Value,
+                    SyncFileExtensions = GetFileExtensions().ToList()
                 };
 
                 using var response = await PostJson("/download/file-list", payload);
@@ -457,7 +571,10 @@ namespace DSPRemoteSaves
                 switch (result?.Code)
                 {
                     case 0:
-                        return result.Payload?.Files ?? new List<RemoteFile>();
+                        
+                            
+                            return result.Payload.Files;
+                        
                     default:
                         await HandleErrorResponse(response);
                         return null;
@@ -605,7 +722,7 @@ namespace DSPRemoteSaves
 
                             using var content = new ByteArrayContent(buffer, 0, bytesRead);
                             var response = await httpClient.PostAsync(
-                                $"/upload/chunk?fileId={fileId}&chunkIndex={meta.Index}",
+                                httpClient.BaseAddress + $"/upload/chunk?fileId={fileId}&chunkIndex={meta.Index}",
                                 content,
                                 cts.Token
                             );
