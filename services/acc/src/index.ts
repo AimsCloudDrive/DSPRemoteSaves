@@ -7,10 +7,20 @@ import { v4 as uuidv4 } from "uuid";
 import { mergeChunks } from "./mergeChunk";
 import { createServer, type ServerRoute } from "./server";
 import { UserAPI, DownloadAPI, UploadAPI, Response } from "./type";
+import {
+  baseSavePath,
+  DBName,
+  MongonServerAuth,
+  MongonServerUrl,
+  port,
+  serverBasePath,
+  UserCollectionName,
+} from "./config";
 
 function assert(condition: unknown, message: string = ""): asserts condition {
   if (!condition) throw Error(message);
 }
+const saltRounds = 10;
 
 class CodeResult<
   C extends number = number,
@@ -44,7 +54,6 @@ class CodeResult<
   }
 }
 
-const saltRounds: number = 10;
 async function createUser(
   users: Collection<IUser>,
   user: UserAPI.UserRequestBody
@@ -98,21 +107,18 @@ async function checkUser(
   }
 }
 
-new MongoClient("mongodb://never.aims.nevermonarch.cn:57857/", {
-  auth: {
-    username: "root",
-    password: "123456",
-  },
+new MongoClient(MongonServerUrl, {
+  auth: MongonServerAuth,
 })
   .connect()
   .then(
     async (client) => {
-      const db = client.db("DSPCloudSaves");
-      const users = db.collection<IUser>("Users");
-      createServer(9999, {
+      const db = client.db(DBName);
+      const users = db.collection<IUser>(UserCollectionName);
+      createServer(port, {
         routes: [
           {
-            path: "/dsp.saves/api",
+            path: serverBasePath,
             children: [
               {
                 path: "/users",
@@ -140,11 +146,7 @@ new MongoClient("mongodb://never.aims.nevermonarch.cn:57857/", {
           },
         ],
         createHandle: () => {
-          console.log("server startting on 9999");
-        },
-        middles: (request, _, next) => {
-          console.log(request.url);
-          next();
+          console.log("server startting on " + port);
         },
       });
     },
@@ -164,8 +166,6 @@ interface IUser extends UserAPI.UserRequestBody {
   };
   login: boolean;
 }
-
-const baseSavePath = "./saves";
 
 interface FileInitUploadInfo {
   userName: string;
