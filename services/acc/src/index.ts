@@ -6,6 +6,7 @@ import path from "path";
 import { v4 as uuidv4 } from "uuid";
 import { mergeChunks } from "./mergeChunk";
 import { createServer, type ServerRoute } from "./server";
+import { UserAPI, DownloadAPI, UploadAPI, Response } from "./type";
 
 function assert(condition: unknown, message: string = ""): asserts condition {
   if (!condition) throw Error(message);
@@ -46,7 +47,7 @@ class CodeResult<
 const saltRounds: number = 10;
 async function createUser(
   users: Collection<IUser>,
-  user: Omit<IUser, "cache">
+  user: UserAPI.UserRequestBody
 ) {
   const checked = await checkUser(users, user);
   if (checked.code !== 1) {
@@ -77,7 +78,8 @@ async function checkUser(
   {
     userName,
     password = "",
-  }: Pick<IUser, "userName"> & Partial<Pick<IUser, "password">>,
+  }: Pick<UserAPI.UserRequestBody, "userName"> &
+    Partial<Pick<UserAPI.UserRequestBody, "password">>,
   options?: boolean | { comparePassword?: boolean }
 ) {
   const finded = await users.findOne({
@@ -151,9 +153,7 @@ new MongoClient("mongodb://never.aims.nevermonarch.cn:57857/", {
     }
   );
 
-interface IUser {
-  userName: string;
-  password: string;
+interface IUser extends UserAPI.UserRequestBody {
   cache: {
     [K in string]: Omit<
       FileInitUploadInfo,
@@ -198,7 +198,7 @@ const init_upload: Handler = (users) => {
           userName,
           password,
           ttl = 5 * 60,
-        } = request.body;
+        } = request.body as UploadAPI.InitRequestBody;
         const userChecked = await checkUser(users, { userName, password });
         if (userChecked.code !== 0) {
           userChecked.code = 1;
@@ -270,8 +270,8 @@ const upload_chunk: Handler = (users) => {
     method: "post",
     handlers: [
       (request, response) => {
-        const fileId = request.query.fileId as string;
-        const _chunkIndex = request.query.chunkIndex;
+        const { fileId, chunkIndex: _chunkIndex } =
+          request.query as unknown as UploadAPI.ChunkRequestQuery;
         const chunkIndex =
           typeof _chunkIndex === "string" ? parseInt(_chunkIndex) : Number.NaN;
 
@@ -336,7 +336,7 @@ const complete_upload: Handler = (users) => {
     method: "post",
     handlers: [
       async (request, response) => {
-        const { fileId } = request.body;
+        const { fileId } = request.body as UploadAPI.CompleteRequestBody;
         const upload = uploads[fileId];
 
         if (!upload || upload.uploadedChunks.size !== upload.totalChunks) {
@@ -405,10 +405,11 @@ const file_list: Handler = (users) => {
     path: "/file-list",
     handlers: [
       async (request, response) => {
-        const { userName, password, syncFileExtensions = [] } = request.body;
+        const { userName, password, syncFileExtensions } =
+          request.body as DownloadAPI.FileListRequestBody;
         if (!userName || !password) {
           response.status(400);
-          response.send({ code: 1, message: "用户名或密码不能为空" });
+          response.json({ code: 1, message: "用户名或密码不能为空" });
           return;
         }
         // 检查用户是否存在
@@ -431,15 +432,18 @@ const file_list: Handler = (users) => {
         }
 
         const extensions = new Set<string>(
-          (Array.isArray(syncFileExtensions)
-            ? syncFileExtensions
-            : String(syncFileExtensions).split(",")
-          ).map((ext) => ext.trim().toLowerCase())
+          syncFileExtensions == undefined
+            ? []
+            : (Array.isArray(syncFileExtensions)
+                ? syncFileExtensions
+                : String(syncFileExtensions).split(",")
+              ).map((ext) => ext.trim().toLowerCase())
         );
-        extensions.forEach((e) => console.log(e));
         const files = (created ? [] : fs.readdirSync(savepath))
           .filter((fileName) =>
-            extensions.has(path.extname(fileName).toLowerCase())
+            syncFileExtensions == undefined
+              ? true
+              : extensions.has(path.extname(fileName).toLowerCase())
           )
           .map((fileName) => {
             const stats = fs.statSync(path.resolve(savepath, fileName));
@@ -448,7 +452,9 @@ const file_list: Handler = (users) => {
               fileSize: stats.size,
             };
           });
-        response.status(200).send(new CodeResult(0, { files }));
+        response
+          .status(200)
+          .json(new CodeResult<0, Response.FileListResponse>(0, { files }));
       },
     ],
     method: "post",
@@ -460,7 +466,8 @@ const download: Handler = (users) => {
     handlers: [
       async (request, response) => {
         try {
-          const { userName, password, fileName, isChunk } = request.body;
+          const { userName, password, fileName, isChunk } =
+            request.body as DownloadAPI.DownloadRequestBody;
 
           // 验证必要参数
           if (!userName || !password || !fileName) {
@@ -551,7 +558,10 @@ const create_user: Handler = (users) => {
     method: "post",
     handlers: [
       async (request, response) => {
-        const created = await createUser(users, request.body);
+        const created = await createUser(
+          users,
+          request.body as UserAPI.UserRequestBody
+        );
         if (created.code === 0) {
           response.status(200);
         } else {
@@ -569,7 +579,8 @@ const update_user: Handler = (users) => {
     handlers: [
       async (request, response) => {
         try {
-          const { userName, password, newPassword } = request.body;
+          const { userName, password, newPassword } =
+            request.body as UserAPI.UpdateRequestBody;
 
           // 参数校验
           if (!userName || !password || !newPassword) {
@@ -612,7 +623,8 @@ const delete_user: Handler = (users) => {
     handlers: [
       async (request, response) => {
         try {
-          const { userName, password } = request.body;
+          const { userName, password } =
+            request.body as UserAPI.UserRequestBody;
 
           // 参数校验
           if (!userName || !password) {
@@ -621,7 +633,7 @@ const delete_user: Handler = (users) => {
           }
 
           // 验证用户身份
-          const checked = await checkUser(users, { userName, password });
+          const checked = await checkUser(users, request.body);
           if (checked.code !== 0) {
             checked.code = 1;
             response.status(401).json(checked);
@@ -675,7 +687,8 @@ const login_user: Handler = (users) => {
     handlers: [
       async (request, response) => {
         try {
-          const { userName, password } = request.body;
+          const { userName, password } =
+            request.body as UserAPI.UserRequestBody;
 
           // 参数校验
           if (!userName || !password) {
@@ -684,7 +697,7 @@ const login_user: Handler = (users) => {
           }
 
           // 验证用户身份
-          const checked = await checkUser(users, { userName, password });
+          const checked = await checkUser(users, request.body);
           if (checked.code !== 0) {
             checked.code = 1;
             response.status(401).json(checked);
@@ -697,10 +710,10 @@ const login_user: Handler = (users) => {
           if (result.matchedCount > 0) {
             response.status(200).json(new CodeResult(0, "登录成功"));
           } else {
-            response.status(500).send(new CodeResult(0, "登录失败"));
+            response.status(500).json(new CodeResult(0, "登录失败"));
           }
         } catch (error) {
-          response.status(500).send(new CodeResult(0, "登录失败"));
+          response.status(500).json(new CodeResult(0, "登录失败"));
         }
       },
     ],
@@ -713,7 +726,8 @@ const logout_user: Handler = (users) => {
     handlers: [
       async (request, response) => {
         try {
-          const { userName, password } = request.body;
+          const { userName, password } =
+            request.body as UserAPI.UserRequestBody;
 
           // 参数校验
           if (!userName || !password) {
@@ -722,7 +736,7 @@ const logout_user: Handler = (users) => {
           }
 
           // 验证用户身份
-          const checked = await checkUser(users, { userName, password });
+          const checked = await checkUser(users, request.body);
           if (checked.code !== 0) {
             checked.code = 1;
             response.status(401).json(checked);
@@ -735,10 +749,10 @@ const logout_user: Handler = (users) => {
           if (result.modifiedCount > 0) {
             response.status(200).json(new CodeResult(0, "登出成功"));
           } else {
-            response.status(500).send(new CodeResult(1));
+            response.status(500).json(new CodeResult(1));
           }
         } catch (error) {
-          response.status(500).send(new CodeResult(1));
+          response.status(500).json(new CodeResult(1));
         }
       },
     ],
