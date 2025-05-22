@@ -61,11 +61,11 @@ namespace DSPRemoteSaves
                     BaseAddress = new Uri(configServerURL.Value + "/dsp.saves/api")
                 };
                 Harmony.CreateAndPatchAll(typeof(DSPRemoteSaves));
+                Logger.LogInfo($"{NAME} loaded");
             }
             catch (Exception ex)
             {
-                Debug.LogError("插件加载失败");
-                Debug.LogException(ex);
+                Logger.LogError($"插件加载失败: {FormatException(ex)}");
                 // 确保异常能被Unity捕获
                 throw new InvalidOperationException("Critical plugin failure", ex);
             }
@@ -104,7 +104,7 @@ namespace DSPRemoteSaves
         public void Start()
         {
             if (!CheckConfig()) return;
-            Debug.Log("OnGameStart");
+            Logger.LogDebug("OnGameStart");
             // 同步执行下载任务（带超时机制）
             var downloadTask = Task.Run(() => DownloadSaves());
             try
@@ -119,7 +119,7 @@ namespace DSPRemoteSaves
             {
                 foreach (var e in ae.InnerExceptions)
                 {
-                    Debug.LogError($"下载终止: {FormatException(e)}");
+                    Logger.LogError($"下载终止: {FormatException(e)}");
                 }
             }
         }
@@ -132,7 +132,7 @@ namespace DSPRemoteSaves
             try
             {
                 // 初始化文件快照
-                if (!UpdateFileSnapshot(savePath, extensions))
+                if (!await UpdateFileSnapshot(savePath, extensions))
                 {
                     return;
                 }
@@ -145,7 +145,7 @@ namespace DSPRemoteSaves
                     var changedFiles = GetChangedFiles(savePath, extensions);
                     if (changedFiles.Count == 0) continue;
 
-                    Debug.Log($"检测到 {changedFiles.Count} 个文件变更，开始同步...");
+                    Logger.LogDebug($"检测到 {changedFiles.Count} 个文件变更，开始同步...");
 
                     // 2. 并行上传变更文件
                     var semaphore = new SemaphoreSlim(configMaxParallelUploadCount.Value);
@@ -162,7 +162,7 @@ namespace DSPRemoteSaves
                         }
                         catch (Exception ex)
                         {
-                            Debug.LogError($"文件同步失败 [{Path.GetFileName(filePath)}]: {FormatException(ex)}");
+                            Logger.LogError($"文件同步失败 [{Path.GetFileName(filePath)}]: {FormatException(ex)}");
                         }
                         finally
                         {
@@ -179,19 +179,28 @@ namespace DSPRemoteSaves
             }
             catch (Exception ex)
             {
-                Debug.LogError($"同步循环异常: {FormatException(ex)}");
+                Logger.LogError($"同步循环异常: {FormatException(ex)}");
             }
         }
 
-        private bool UpdateFileSnapshot(string savePath, IEnumerable<string> extensions)
+        private async Task<bool> UpdateFileSnapshot(string savePath, IEnumerable<string> extensions)
         {
             if (!Directory.Exists(savePath)) return false;
+            var fileNames = (await GetRemoteFileList(false)).ToArray<RemoteFile>().Select(f => f.FileName).ToArray();
 
             foreach (var filePath in Directory.GetFiles(savePath))
             {
                 if (!ShouldProcessFile(filePath, extensions)) continue;
 
                 var fileName = Path.GetFileName(filePath);
+                if (!fileNames.Contains(fileName)) {
+                   var success = await UploadSingleFile(filePath);
+                    if (!success) {
+                        _fileLastWriteTimes.Clear();
+                        Logger.LogError($"Failed to upload file: {fileName}");
+                        return false;
+                    }
+                }
                 var lastWrite = File.GetLastWriteTimeUtc(filePath);
                 _fileLastWriteTimes[fileName] = lastWrite;
             }
@@ -223,7 +232,7 @@ namespace DSPRemoteSaves
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogWarning($"文件访问异常 [{filePath}]: {ex.Message}");
+                    Logger.LogWarning($"文件访问异常 [{filePath}]: {ex.Message}");
                 }
             }
             return changedFiles;
@@ -235,7 +244,7 @@ namespace DSPRemoteSaves
         {
             if (!CheckConfig()) return;
             _loopCts?.Cancel();
-            Debug.Log("OnGameEnd");
+            Logger.LogDebug("OnGameEnd");
         }
 
         private bool CheckConfig()
@@ -285,10 +294,11 @@ namespace DSPRemoteSaves
             [JsonProperty("password")]
             public string Password { get; set; }
         }
-        public class FileListRequest : AuthRequest {
+        public class FileListRequest : AuthRequest
+        {
             [JsonProperty("syncFileExtensions")]
             public List<string> SyncFileExtensions { get; set; } = new List<string>();
-        
+
         }
 
         public class UploadInitRequest : AuthRequest
@@ -402,10 +412,10 @@ namespace DSPRemoteSaves
             try
             {
                 // 获取远程文件列表
-                var remoteFiles = await GetRemoteFileList();
+                var remoteFiles = await GetRemoteFileList(false);
                 if (remoteFiles == null || remoteFiles.Count == 0)
                 {
-                    Debug.Log("服务器没有可用的存档文件");
+                    Logger.LogDebug("服务器没有可用的存档文件");
                     return;
                 }
 
@@ -418,11 +428,11 @@ namespace DSPRemoteSaves
 
                 if (filesToDownload.Count == 0)
                 {
-                    Debug.Log("没有需要下载的存档文件");
+                    Logger.LogDebug("没有需要下载的存档文件");
                     return;
                 }
 
-                Debug.Log($"开始下载 {filesToDownload.Count} 个存档文件...");
+                Logger.LogDebug($"开始下载 {filesToDownload.Count} 个存档文件...");
 
                 // 控制最大并发数
                 var semaphore = new SemaphoreSlim(configMaxParallelDownloadCount.Value);
@@ -432,27 +442,27 @@ namespace DSPRemoteSaves
                     await semaphore.WaitAsync();
                     try
                     {
-                        Debug.Log($"正在下载文件：{file.FileName}");
+                        Logger.LogDebug($"正在下载文件：{file.FileName}");
 
                         // 调用实际下载方法（需实现DownloadFileAsync）
                         await DownloadSingleFile(file.FileName);
 
-                        Debug.Log($"成功下载文件：{file.FileName}");
+                        Logger.LogDebug($"成功下载文件：{file.FileName}");
                     }
                     catch (Exception ex)
                     {
-                        Debug.LogError($"下载文件 {file.FileName} 时出错：{FormatException(ex)}");
+                        Logger.LogError($"下载文件 {file.FileName} 时出错：{FormatException(ex)}");
                     }
                     finally { semaphore.Release(); }
                 }).ToList();
 
                 // 等待所有下载任务完成
                 await Task.WhenAll(downloadTasks);
-                Debug.Log("所有文件下载完成");
+                Logger.LogDebug("所有文件下载完成");
             }
             catch (Exception e)
             {
-                Debug.LogError($"存档下载失败: {FormatException(e)}");
+                Logger.LogError($"存档下载失败: {FormatException(e)}");
             }
         }
 
@@ -485,7 +495,7 @@ namespace DSPRemoteSaves
                 }
                 catch (Exception e)
                 {
-                    Debug.LogWarning($"无法读取本地文件 {filePath}: {e.Message}");
+                    Logger.LogWarning($"无法读取本地文件 {filePath}: {e.Message}");
                 }
             }
             return index;
@@ -527,7 +537,7 @@ namespace DSPRemoteSaves
                     FileName = fileName,
                     IsChunk = false
                 };
-                Debug.Log($"下载存档{payload.UserName}/{payload.FileName}...");
+                Logger.LogDebug($"下载存档{payload.UserName}/{payload.FileName}...");
 
                 using var response = await PostJson("/download/download", payload);
                 if (!response.IsSuccessStatusCode) return false;
@@ -535,22 +545,26 @@ namespace DSPRemoteSaves
                 var savePath = Path.Combine(GetSavePath(), fileName);
                 using var fileStream = File.Create(savePath);
                 await response.Content.CopyToAsync(fileStream);
-                Debug.Log($"下载完成{payload.UserName}/{payload.FileName}...");
+                Logger.LogDebug($"下载完成{payload.UserName}/{payload.FileName}...");
                 return true;
             }
             catch (Exception e)
             {
-                Debug.LogError($"文件下载失败 ({fileName}): {FormatException(e)}");
+                Logger.LogError($"文件下载失败 ({fileName}): {FormatException(e)}");
                 return false;
             }
         }
 
 
-        private async Task<List<RemoteFile>> GetRemoteFileList()
+        private async Task<List<RemoteFile>> GetRemoteFileList(bool all = false)
         {
             try
             {
-                var payload = new FileListRequest
+                var payload = all == true ? new FileListRequest
+                {
+                    UserName = configUsername.Value,
+                    Password = configPassword.Value,
+                } : new FileListRequest
                 {
                     UserName = configUsername.Value,
                     Password = configPassword.Value,
@@ -561,7 +575,7 @@ namespace DSPRemoteSaves
                 if (!response.IsSuccessStatusCode)
                 {
 
-                    Debug.Log("请求失败");
+                    Logger.LogDebug("请求失败");
                     return null;
                 };
 
@@ -571,10 +585,10 @@ namespace DSPRemoteSaves
                 switch (result?.Code)
                 {
                     case 0:
-                        
-                            
-                            return result.Payload.Files;
-                        
+
+
+                        return result.Payload.Files;
+
                     default:
                         await HandleErrorResponse(response);
                         return null;
@@ -582,7 +596,7 @@ namespace DSPRemoteSaves
             }
             catch (Exception e)
             {
-                Debug.LogError($"获取文件列表失败: {FormatException(e)}");
+                Logger.LogError($"获取文件列表失败: {FormatException(e)}");
                 return null;
             }
         }
@@ -598,7 +612,7 @@ namespace DSPRemoteSaves
                     .Where(f => ShouldProcessFile(f, GetFileExtensions()))
                     .ToList(); // 立即执行避免延迟
 
-                Debug.Log($"开始上传 {files.Count} 个存档文件...");
+                Logger.LogDebug($"开始上传 {files.Count} 个存档文件...");
 
                 // 添加并行上传支持
                 var semaphore = new SemaphoreSlim(configMaxParallelUploadCount.Value);
@@ -619,7 +633,7 @@ namespace DSPRemoteSaves
             }
             catch (Exception e)
             {
-                Debug.LogError($"存档上传失败: {FormatException(e)}");
+                Logger.LogError($"存档上传失败: {FormatException(e)}");
             }
         }
 
@@ -642,7 +656,7 @@ namespace DSPRemoteSaves
             }
             catch (Exception e)
             {
-                Debug.LogError($"文件上传失败 ({Path.GetFileName(filePath)}): {FormatException(e)}");
+                Logger.LogError($"文件上传失败 ({Path.GetFileName(filePath)}): {FormatException(e)}");
                 return false;
             }
         }
@@ -669,7 +683,7 @@ namespace DSPRemoteSaves
             }
             catch (Exception e)
             {
-                Debug.LogError($"上传初始化失败: {FormatException(e)}");
+                Logger.LogError($"上传初始化失败: {FormatException(e)}");
                 return (null, 0);
             }
         }
@@ -714,7 +728,7 @@ namespace DSPRemoteSaves
 
                             if (bytesRead != meta.ChunkLength)
                             {
-                                Debug.LogError($"分片{meta.Index}读取不完整 ({bytesRead}/{meta.ChunkLength} bytes)");
+                                Logger.LogError($"分片{meta.Index}读取不完整 ({bytesRead}/{meta.ChunkLength} bytes)");
                                 failedChunks.Add(meta.Index);
                                 cts.Cancel();
                                 return;
@@ -741,7 +755,7 @@ namespace DSPRemoteSaves
                     }
                     catch (Exception ex)
                     {
-                        Debug.LogError($"分片{meta.Index}上传失败: {ex.Message}");
+                        Logger.LogError($"分片{meta.Index}上传失败: {ex.Message}");
                         failedChunks.Add(meta.Index);
                         cts.Cancel();
                     }
@@ -762,16 +776,16 @@ namespace DSPRemoteSaves
 
                 if (!failedChunks.IsEmpty)
                 {
-                    Debug.LogError($"以下分片上传失败: {string.Join(", ", failedChunks)}");
+                    Logger.LogError($"以下分片上传失败: {string.Join(", ", failedChunks)}");
                     return false;
                 }
 
-                Debug.Log($"成功上传 {totalChunks} 个分片");
+                Logger.LogDebug($"成功上传 {totalChunks} 个分片");
                 return true;
             }
             catch (Exception e)
             {
-                Debug.LogError($"分片上传过程异常: {FormatException(e)}");
+                Logger.LogError($"分片上传过程异常: {FormatException(e)}");
                 return false;
             }
         }
@@ -790,13 +804,12 @@ namespace DSPRemoteSaves
                 using var response = await PostJson("/upload/complete", payload);
                 var responseString = await response.Content.ReadAsStringAsync();
                 var result = new CustomJsonSerializer().Deserialize<UploadCompleteResponse>(responseString);
-
                 switch (result?.Code)
                 {
                     case 0:
                         return true;
                     case 1 when result.Payload?.Nots != null:
-                        Debug.LogError($"缺失分片: {string.Join(", ", result.Payload.Nots)}");
+                        Logger.LogError($"缺失分片: {string.Join(", ", result.Payload.Nots)}");
                         return false;
                     default:
                         await HandleErrorResponse(response);
@@ -805,7 +818,7 @@ namespace DSPRemoteSaves
             }
             catch (Exception e)
             {
-                Debug.LogError($"上传完成失败: {FormatException(e)}");
+                Logger.LogError($"上传完成失败: {FormatException(e)}");
                 return false;
             }
         }
@@ -841,11 +854,11 @@ namespace DSPRemoteSaves
                                .AppendLine($"JSON解析失败: {jsonEx.Message}");
                 }
 
-                Debug.LogError(errorMessage.ToString());
+                Logger.LogError(errorMessage.ToString());
             }
             catch (Exception ex)
             {
-                Debug.LogError($"错误处理过程中发生异常: {FormatException(ex)}");
+                Logger.LogError($"错误处理过程中发生异常: {FormatException(ex)}");
             }
         }
 
@@ -856,17 +869,17 @@ namespace DSPRemoteSaves
                 var json = new CustomJsonSerializer().Serialize(payload);
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-                Debug.Log($"Sending to {endpoint}: {json}");
+                Logger.LogDebug($"Sending to {endpoint}: {json}");
                 return await httpClient.PostAsync(httpClient.BaseAddress + endpoint, content);
             }
             catch (TaskCanceledException)
             {
-                Debug.LogError("请求超时");
+                Logger.LogError("请求超时");
                 throw new Exception("请求超时");
             }
             catch (HttpRequestException e)
             {
-                Debug.LogError($"网络请求失败: {e.Message}");
+                Logger.LogError($"网络请求失败: {e.Message}");
                 throw new Exception("网络请求失败");
             }
         }
@@ -1040,7 +1053,7 @@ namespace DSPRemoteSaves
                     return ParseString(json, ref index);
                 }
                 // 处理null
-                else if (json.Substring(index, 4) == "null")
+                else if (index + 4 < json.Length && json.Substring(index, 4) == "null")
                 {
                     index += 4;
                     return null;

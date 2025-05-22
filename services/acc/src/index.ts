@@ -148,6 +148,14 @@ new MongoClient(MongonServerUrl, {
         createHandle: () => {
           console.log("server startting on " + port);
         },
+        middles: (request, _, next) => {
+          if (request.headers["content-type"] === "application/json") {
+            console.log(request.url, request.body);
+          } else {
+            console.log(request.url, request.query);
+          }
+          next();
+        },
       });
     },
     () => {
@@ -374,7 +382,7 @@ const complete_upload: Handler = (users) => {
           );
           mergeChunks(tempDir, finalPath, upload.totalChunks)
             .then(() => {
-              response.status(200).json(new CodeResult(0));
+              response.status(200).json(new CodeResult(0, null));
             })
             .finally(async () => {
               try {
