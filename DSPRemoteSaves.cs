@@ -18,19 +18,19 @@ using System.Collections.Concurrent;
 namespace DSPRemoteSaves
 {
     [BepInPlugin(GUID, NAME, VERSION)]
+    [BepInDependency("com.bepis.bepinex.configurationmanager", BepInDependency.DependencyFlags.SoftDependency)]
     [BepInProcess(GAME_PROCESS)]
-    public class DSPRemoteSaves : BaseUnityPlugin
+    public partial class DSPRemoteSaves : BaseUnityPlugin
     {
         public const string GUID = "com.aims.remotesaves";
         public const string NAME = "RemoteSaves";
-        public const string VERSION = "2.1.1";
+        public const string VERSION = "2.2.0";
         public const string GAME_PROCESS = "DSPGAME.exe";
 
         #region Config Settings
         private ConfigEntry<string> configServerURL;
         private ConfigEntry<string> configUsername;
         private ConfigEntry<string> configPassword;
-        private ConfigEntry<bool> configDownloadAll;
         private ConfigEntry<string> configFileExtensions;
         private ConfigEntry<int> configChunkSize;
         private ConfigEntry<int> configChunkThresholdMB;
@@ -38,9 +38,8 @@ namespace DSPRemoteSaves
         private ConfigEntry<int> configMaxParallelDownloadCount;
         private ConfigEntry<int> configMaxParallelUploadCount;
         private ConfigEntry<int> configMaxChunkParallelUploadCount;
-        private ConfigEntry<int> configCheckInterval;
-        private ConfigEntry<int> configExitSyncTimeout;
-        private ConfigEntry<bool> configExitBackgroundUpload;
+        private ConfigEntry<KeyCode> configPanelHotkey;
+        private ConfigEntry<int> configAutoRefreshSeconds;
         #endregion Config Settings
 
         /// <summary>云端与本地时间戳比较时允许的误差（毫秒）</summary>
@@ -49,36 +48,31 @@ namespace DSPRemoteSaves
         private const int MinChunkBytes = 64 * 1024;
         /// <summary>服务端允许的单个分片上限（对应 storage.max_chunk_size 默认值 64MB），超过只能分片</summary>
         private const int MaxSingleChunkBytes = 64 * 1024 * 1024;
-        /// <summary>启动时最多阻塞主线程等待首次下载的时间</summary>
 
         private HttpClient httpClient;
-        /// <summary>服务端 SM2 公钥；启动/首次请求时拉取，收到 2005 时强制刷新</summary>
+        /// <summary>服务端 SM2 公钥；首次请求时拉取，收到 2005 时强制刷新</summary>
         private PublicKeyInfo _publicKey;
         private DateTime _publicKeyFetchedUtc = DateTime.MinValue;
-        private ConcurrentDictionary<string, DateTime> _fileLastWriteTimes = new ConcurrentDictionary<string, DateTime>();
-        private CancellationTokenSource _loopCts;
-        private FileSystemWatcher _saveWatcher;
-        private readonly SemaphoreSlim _syncSignal = new SemaphoreSlim(0, 1);
-        private readonly SemaphoreSlim _syncLock = new SemaphoreSlim(1, 1);
-        private int _shuttingDown;
+        /// <summary>配置不完整/地址非法时的提示，供面板展示</summary>
+        private string _configError;
+        /// <summary>游戏内云存档面板（手动上传/下载）</summary>
+        private SavePanel _panel;
+        /// <summary>Configuration Manager 自定义绘制器对应的入口项</summary>
+        private ConfigEntry<bool> configPanelEntry;
+        /// <summary>最近一次服务端返回的错误信息（用于面板错误行）</summary>
+        private string _lastServerError;
+        internal string LastServerError => _lastServerError;
 
         public void Awake()
         {
             try
             {
-                // 配置初始化
+                // 只做配置与网络客户端初始化，不再在启动/退出时自动传输：
+                // 上传与下载全部由游戏内云存档面板交给玩家逐项确认。
                 InitConfig();
-                if (!CheckConfig())
-                {
-                    return;
-                }
-                // 网络客户端初始化：超时改为按请求设置，避免大分片被 30 秒全局超时打断
-                httpClient = new HttpClient
-                {
-                    Timeout = System.Threading.Timeout.InfiniteTimeSpan,
-                    BaseAddress = new Uri(configServerURL.Value.TrimEnd('/') + "/dsp.saves/api")
-                };
-                Logger.LogInfo($"{NAME} loaded");
+                RefreshHttpClient();
+
+                _panel = new SavePanel(this);
             }
             catch (Exception ex)
             {
@@ -92,18 +86,19 @@ namespace DSPRemoteSaves
         {
             configEnabled = Config.Bind("General", "Enabled", true, new ConfigDescription("启用远程存档同步功能"));
 
+            configPanelHotkey = Config.Bind("General", "PanelHotkey", KeyCode.F8,
+                new ConfigDescription("打开/关闭云存档同步面板的快捷键（默认 F8）"));
+
             configServerURL = Config.Bind("Server", "Remote ServerURL", "",
                 new ConfigDescription("远程服务器地址（示例：http://example.com:9999）"));
 
             configUsername = Config.Bind("User", "Username", "", new ConfigDescription("远程服务器用户名"));
             configPassword = Config.Bind("User", "Password", "", new ConfigDescription("远程服务器密码"));
 
-            configDownloadAll = Config.Bind("Performance", "ForceDownloadAll", false,
-                 new ConfigDescription("同步策略：true 表示用云端存档强制覆盖本地（覆盖前会自动备份到 %LOCALAPPDATA%\\DSPRemoteSaves\\backup），false 表示仅当云端更新时才下载"));
             configFileExtensions = Config.Bind("Performance", "SyncFileExtensions", ".dsv,.moddsv,.server",
-                new ConfigDescription("需要同步的文件扩展名列表（使用英文逗号分隔）"));
+                new ConfigDescription("面板中显示的文件扩展名列表（使用英文逗号分隔）"));
             configMaxParallelUploadCount = Config.Bind("Performance", "MaxParallelUploadCount", 3,
-                new ConfigDescription("单个文件上传时的最大并行任务数", new AcceptableValueRange<int>(1, 3)));
+                new ConfigDescription("同时上传的存档数量上限，超出的存档在面板中排队", new AcceptableValueRange<int>(1, 3)));
             configChunkSize = Config.Bind("Performance", "ChunkSize(MB)", 5,
                 new ConfigDescription("大文件分块上传时每个分块的大小（单位：MB）", new AcceptableValueRange<int>(5, 50)));
             configChunkThresholdMB = Config.Bind("Performance", "ChunkThreshold(MB)", 5,
@@ -112,503 +107,128 @@ namespace DSPRemoteSaves
             configMaxChunkParallelUploadCount = Config.Bind("Performance", "MaxChunkParallelUploadCount", 5,
                 new ConfigDescription("单个文件分块上传时的最大并行分块数", new AcceptableValueRange<int>(1, 10)));
             configMaxParallelDownloadCount = Config.Bind("Performance", "MaxParallelDownloadCount", 5,
-                new ConfigDescription("从服务器下载存档时的最大并行任务数", new AcceptableValueRange<int>(1, 10)));
-            configCheckInterval = Config.Bind("Performance", "CheckInterval(s)", 5 * 60,
-                new ConfigDescription("本地存档变更检测间隔（单位：秒）。保存后由文件监视立即触发，此间隔仅作为兜底扫描", new AcceptableValueRange<int>(10, 15 * 60)));
-            configExitBackgroundUpload = Config.Bind("Performance", "ExitBackgroundUpload", true,
-                 new ConfigDescription("退出时把待同步存档直接转交独立进程（DSPSavesUploader.exe）后台上传，游戏立刻退出、界面不卡死；关闭或上传器缺失时才在退出前同步，最多等待 ExitSyncTimeout(s)"));
-            configExitSyncTimeout = Config.Bind("Performance", "ExitSyncTimeout(s)", 20,
-                new ConfigDescription("未启用后台上传时，退出游戏前等待最后一次上传的最长时间（单位：秒，会阻塞主线程）", new AcceptableValueRange<int>(3, 120)));
+                new ConfigDescription("同时下载的存档数量上限", new AcceptableValueRange<int>(1, 10)));
+            configAutoRefreshSeconds = Config.Bind("Performance", "AutoRefresh(s)", 30,
+                new ConfigDescription("面板打开时的自动刷新间隔（秒），0 表示不自动刷新", new AcceptableValueRange<int>(0, 300)));
 
             Config.Save();
         }
 
+        /// <summary>
+        /// F1 里的入口在 Start 阶段绑定：此时 BepInEx 已加载完所有插件（包括
+        /// Configuration Manager），反射一定能找到它的标签类型。
+        /// </summary>
         public void Start()
         {
-            if (!CheckConfig()) return;
-
-            // 下载/补传全部后台执行，绝不阻塞 Unity 主线程（避免启动时游戏无响应）。
-            // 大文件补传由独立上传器进程完成（见 DownloadSaves 第二阶段）。
-            Logger.LogInfo("首次云存档同步已在后台启动（下载与补传均不阻塞游戏）");
-            var downloadTask = Task.Run(DownloadSaves);
-            Task.Run(() => RunAfterInitialDownloadAsync(downloadTask));
-        }
-
-        private async Task RunAfterInitialDownloadAsync(Task downloadTask)
-        {
             try
             {
-                // 快照必须在下载结束后建立，否则会把刚下载的文件当成新存档再传一遍
-                await downloadTask.ConfigureAwait(false);
+                var cmAttr = SavePanel.CreateConfigurationManagerAttributes(
+                    entry => _panel?.DrawConfigEntry(entry));
+                var panelDescription = cmAttr != null
+                    ? new ConfigDescription("打开游戏内云存档同步面板，自行选择要上传或下载的存档", null, new object[] { cmAttr })
+                    : new ConfigDescription("打开游戏内云存档同步面板（未检测到 Configuration Manager，可改用快捷键 " + configPanelHotkey.Value + "）");
+                configPanelEntry = Config.Bind("General", "OpenSyncPanel", false, panelDescription);
+                Config.Save();
+
+                Logger.LogInfo($"{NAME} v{VERSION} 已加载，按 {configPanelHotkey.Value} 打开云存档面板");
+                if (!SavePanel.ConfigurationManagerAvailable)
+                {
+                    Logger.LogWarning("未检测到 BepInEx Configuration Manager：F1 中的面板入口不可用，可直接用快捷键打开面板");
+                }
             }
             catch (Exception ex)
             {
-                // 下载失败不能阻止后续上传
-                Logger.LogError($"首次下载失败，继续启动同步循环: {FormatException(ex)}");
-            }
-
-            try
-            {
-                StartSaveWatcher();
-                await RequestLoop().ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError($"同步循环异常退出: {FormatException(ex)}");
+                Logger.LogError($"面板入口初始化失败（快捷键仍可用）: {FormatException(ex)}");
             }
         }
 
-        private async Task RequestLoop()
+        private void Update()
         {
-            _loopCts = new CancellationTokenSource();
-            var token = _loopCts.Token;
-            var savePath = GetSavePath();
-            var extensions = GetFileExtensions();
-
-            // 快照初始化失败（通常是服务器不可达）时按间隔重试，不能像旧版一样直接退出循环
-            while (!token.IsCancellationRequested)
-            {
-                if (Directory.Exists(savePath) && await UpdateFileSnapshot(savePath, extensions).ConfigureAwait(false))
-                {
-                    break;
-                }
-
-                Logger.LogWarning("初始化文件快照失败，稍后重试");
-                if (!await WaitForNextRound(token).ConfigureAwait(false)) return;
-            }
-
-            while (!token.IsCancellationRequested)
-            {
-                if (!await WaitForNextRound(token).ConfigureAwait(false)) return;
-                try
-                {
-                    await SyncChangedFiles(savePath, extensions, token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    // 单轮失败不应终止整个同步循环
-                    Logger.LogError($"同步失败，将在下一轮重试: {FormatException(ex)}");
-                }
-            }
+            _panel?.Tick();
         }
 
-        private async Task<bool> WaitForNextRound(CancellationToken token)
+        private void OnGUI()
         {
-            var interval = TimeSpan.FromSeconds(Math.Max(10, configCheckInterval.Value));
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(token);
-            var delayTask = Task.Delay(interval, linked.Token);
-            var signalTask = _syncSignal.WaitAsync(linked.Token);
-
-            await Task.WhenAny(delayTask, signalTask).ConfigureAwait(false);
-            linked.Cancel();
-
-            try { await delayTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
-            try { await signalTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
-            return !token.IsCancellationRequested;
-        }
-
-        private async Task SyncChangedFiles(string savePath, IEnumerable<string> extensions, CancellationToken token)
-        {
-            if (token.IsCancellationRequested) return;
-            if (!await _syncLock.WaitAsync(TimeSpan.FromSeconds(5), token).ConfigureAwait(false)) return;
-            try
-            {
-                var changedFiles = GetChangedFiles(savePath, extensions);
-                if (changedFiles.Count == 0) return;
-
-                Logger.LogInfo($"检测到 {changedFiles.Count} 个存档变更，开始同步");
-                var semaphore = new SemaphoreSlim(Math.Max(1, configMaxParallelUploadCount.Value));
-                var uploadTasks = changedFiles.Select(async filePath =>
-                {
-                    await semaphore.WaitAsync(token).ConfigureAwait(false);
-                    try
-                    {
-                        token.ThrowIfCancellationRequested();
-                        // 游戏可能还在写盘，等文件大小和时间戳稳定后再传
-                        if (!await WaitForFileReady(filePath, token).ConfigureAwait(false))
-                        {
-                            Logger.LogWarning($"文件仍在写入，跳过本轮: {Path.GetFileName(filePath)}");
-                            return;
-                        }
-
-                        if (await UploadSingleFile(filePath).ConfigureAwait(false))
-                        {
-                            var fileName = Path.GetFileName(filePath);
-                            _fileLastWriteTimes[fileName] = File.GetLastWriteTimeUtc(filePath);
-                            Logger.LogInfo($"已同步存档: {fileName}");
-                        }
-                    }
-                    catch (OperationCanceledException) { }
-                    catch (Exception ex)
-                    {
-                        Logger.LogError($"文件同步失败 [{Path.GetFileName(filePath)}]: {FormatException(ex)}");
-                    }
-                    finally
-                    {
-                        semaphore.Release();
-                    }
-                }).ToList();
-
-                await Task.WhenAll(uploadTasks).ConfigureAwait(false);
-            }
-            finally
-            {
-                _syncLock.Release();
-            }
-        }
-
-        /// <summary>轮询文件大小与时间戳，确认存档已写完后返回 true</summary>
-        private async Task<bool> WaitForFileReady(string filePath, CancellationToken token, int checks = 10, int intervalMs = 400)
-        {
-            long lastLength = -1;
-            DateTime lastWrite = DateTime.MinValue;
-
-            for (int i = 0; i < checks; i++)
-            {
-                token.ThrowIfCancellationRequested();
-                try
-                {
-                    var info = new FileInfo(filePath);
-                    if (!info.Exists) return false;
-
-                    if (info.Length > 0 && info.Length == lastLength && info.LastWriteTimeUtc == lastWrite)
-                    {
-                        return true;
-                    }
-
-                    lastLength = info.Length;
-                    lastWrite = info.LastWriteTimeUtc;
-                }
-                catch (IOException)
-                {
-                    // 文件正被游戏独占，稍后再试
-                }
-
-                await Task.Delay(intervalMs, token).ConfigureAwait(false);
-            }
-
-            return false;
-        }
-
-        private void StartSaveWatcher()
-        {
-            try
-            {
-                var savePath = GetSavePath();
-                if (!Directory.Exists(savePath)) return;
-
-                _saveWatcher = new FileSystemWatcher(savePath)
-                {
-                    IncludeSubdirectories = false,
-                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime
-                };
-
-                FileSystemEventHandler onChanged = (_, __) => RequestImmediateSync();
-                RenamedEventHandler onRenamed = (_, __) => RequestImmediateSync();
-
-                _saveWatcher.Created += onChanged;
-                _saveWatcher.Changed += onChanged;
-                _saveWatcher.Renamed += onRenamed;
-                _saveWatcher.Error += (_, e) => Logger.LogWarning($"存档目录监视异常: {e.GetException()?.Message}");
-                _saveWatcher.EnableRaisingEvents = true;
-                Logger.LogInfo($"已监视存档目录: {savePath}");
-            }
-            catch (Exception ex)
-            {
-                // 监视不可用时退回定时轮询
-                Logger.LogWarning($"无法启动存档目录监视，将仅使用定时轮询: {ex.Message}");
-            }
-        }
-
-        private void RequestImmediateSync()
-        {
-            if (Volatile.Read(ref _shuttingDown) == 1) return;
-            try
-            {
-                if (_syncSignal.CurrentCount == 0) _syncSignal.Release();
-            }
-            catch (SemaphoreFullException) { }
+            _panel?.Draw();
         }
 
         /// <summary>
-        /// 游戏退出前做最后一次同步。默认**不阻塞主线程**：把待同步清单直接转交独立上传进程，
-        /// 游戏立刻退出；只有关闭后台上传（或找不到上传器）时才在进程内等待，受 ExitSyncTimeout 限制。
+        /// 校验基础配置并（重新）建立 HttpClient。切换服务器或账号后会在下一次
+        /// 打开/刷新面板时生效；有传输正在进行时不允许切换，避免中途换连接。
         /// </summary>
-        public void OnApplicationQuit()
+        private bool RefreshHttpClient()
         {
-            if (!CheckConfig()) return;
-            if (Interlocked.Exchange(ref _shuttingDown, 1) == 1) return;
+            _configError = null;
 
-            _loopCts?.Cancel();
-            if (_saveWatcher != null) _saveWatcher.EnableRaisingEvents = false;
-
-            try
+            if (!configEnabled.Value)
             {
-                var changedFiles = GetChangedFiles(GetSavePath(), GetFileExtensions());
-                if (changedFiles.Count == 0)
-                {
-                    Logger.LogInfo("退出前没有待同步的存档");
-                    return;
-                }
-
-                // 优先转交后台进程：退出路径上不做任何网络等待，避免 Unity 主线程卡死（游戏未响应）
-                if (configExitBackgroundUpload.Value)
-                {
-                    Logger.LogInfo($"退出前发现 {changedFiles.Count} 个存档待同步，转交后台上传进程");
-                    if (HandOffToBackgroundUploader(changedFiles)) return;
-                    Logger.LogWarning("转交后台上传进程失败，改为退出前同步");
-                }
-
-                FlushOnExit(changedFiles);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError($"退出同步失败: {FormatException(ex)}");
-            }
-        }
-
-        /// <summary>进程内退出同步：会阻塞主线程，仅在无法使用后台上传时调用</summary>
-        private void FlushOnExit(System.Collections.Generic.List<string> changedFiles)
-        {
-            var lockTaken = false;
-            try
-            {
-                // 等正在进行的同步结束，避免同一文件被并发上传
-                lockTaken = _syncLock.Wait(TimeSpan.FromSeconds(3));
-
-                var timeout = TimeSpan.FromSeconds(Math.Max(3, configExitSyncTimeout.Value));
-                Logger.LogInfo($"退出前同步 {changedFiles.Count} 个存档（最多等待 {timeout.TotalSeconds:0} 秒）");
-
-                var succeeded = new System.Collections.Concurrent.ConcurrentBag<string>();
-                var flushTask = Task.Run(async () =>
-                {
-                    foreach (var filePath in changedFiles)
-                    {
-                        if (!await WaitForFileReady(filePath, CancellationToken.None, 3, 200).ConfigureAwait(false))
-                        {
-                            continue;
-                        }
-
-                        if (await UploadSingleFile(filePath).ConfigureAwait(false))
-                        {
-                            succeeded.Add(filePath);
-                            Logger.LogInfo($"退出前已同步: {Path.GetFileName(filePath)}");
-                        }
-                    }
-                });
-
-                try
-                {
-                    if (!flushTask.Wait(timeout))
-                    {
-                        Logger.LogWarning("退出同步超时，未完成的存档将转交后台上传进程");
-                    }
-                }
-                catch (AggregateException ae)
-                {
-                    foreach (var e in ae.InnerExceptions) Logger.LogError($"退出同步异常: {FormatException(e)}");
-                }
-
-                // 未完成的存档转交独立进程后台上传，游戏立即退出
-                var remaining = changedFiles
-                    .Where(f => !succeeded.Contains(f))
-                    .ToList();
-                if (remaining.Count > 0 && configExitBackgroundUpload.Value)
-                {
-                    HandOffToBackgroundUploader(remaining);
-                }
-                else if (remaining.Count > 0)
-                {
-                    Logger.LogWarning("后台转交未启用，未完成的存档会在下次启动时重新上传");
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError($"退出同步失败: {FormatException(ex)}");
-            }
-            finally
-            {
-                if (lockTaken) _syncLock.Release();
-            }
-        }
-
-        /// <summary>
-        /// 把未完成的存档清单写入任务文件并启动独立上传进程，
-        /// 游戏退出后由该进程继续上传（进程间无父子绑定，不受游戏退出影响）。
-        /// 返回 false 表示上传器缺失或启动失败，调用方可退回进程内同步。
-        /// </summary>
-        private bool HandOffToBackgroundUploader(System.Collections.Generic.List<string> files)
-        {
-            try
-            {
-                var exePath = FindUploaderExe();
-                if (string.IsNullOrEmpty(exePath))
-                {
-                    Logger.LogWarning("未找到 DSPSavesUploader.exe（放在 BepInEx/plugins 下即可），未完成的存档会在下次启动时重新上传");
-                    return false;
-                }
-
-                var taskDir = Path.Combine(Path.GetDirectoryName(exePath), "DSPRemoteSaves");
-                Directory.CreateDirectory(taskDir);
-                var taskPath = Path.Combine(taskDir, $"pending-upload-{DateTime.Now:yyyyMMdd-HHmmssff}.json");
-
-                var task = new BackgroundUploadTask
-                {
-                    Server = configServerURL.Value.TrimEnd('/'),
-                    UserName = configUsername.Value,
-                    Password = configPassword.Value,
-                    LogPath = Path.Combine(taskDir, "uploader.log"),
-                    Files = files,
-                    ChunkSizeMB = configChunkSize.Value,
-                    ChunkThresholdMB = configChunkThresholdMB.Value,
-                };
-                File.WriteAllText(taskPath, new CustomJsonSerializer().Serialize(task));
-
-                // 通过 explorer.exe 中介启动：进程归属于 Shell，不在游戏进程树/Job 对象内，
-                // 游戏退出、Steam/r2modman 的 Job 清理都不会连带杀死上传器。
-                // 上传器以无参模式启动，自动扫描约定目录（exe 同目录 DSPRemoteSaves/）
-                // 下的 pending-upload-*.json —— 刚写入的任务清单会被立即处理。
-                // 注：不能用 WMI（Unity Mono 不带 System.Management）。
-                System.Diagnostics.Process.Start("explorer.exe", $"\"{exePath}\"");
-                Logger.LogInfo($"已转交后台上传进程（{files.Count} 个存档继续上传）");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning($"后台上传转交失败，未完成的存档会在下次启动时重新上传: {FormatException(ex)}");
+                _configError = "插件已禁用（F1 → General → Enabled）";
                 return false;
             }
-        }
 
-        /// <summary>按插件目录 → BepInEx/plugins → BepInEx 根的顺序查找上传器</summary>
-        private string FindUploaderExe()
-        {
-            string[] dirs;
-            try
+            var url = (configServerURL.Value ?? string.Empty).Trim().TrimEnd('/');
+            if (url.Length == 0)
             {
-                dirs = new[]
+                _configError = "未配置服务器地址（F1 → Server）";
+                return false;
+            }
+
+            if (!Uri.TryCreate(url + "/dsp.saves/api", UriKind.Absolute, out var baseUri) ||
+                (baseUri.Scheme != Uri.UriSchemeHttp && baseUri.Scheme != Uri.UriSchemeHttps))
+            {
+                _configError = "服务器地址格式不正确";
+                return false;
+            }
+
+            if (string.IsNullOrEmpty(configUsername.Value) || string.IsNullOrEmpty(configPassword.Value))
+            {
+                _configError = "未配置账号或密码（F1 → User）";
+                return false;
+            }
+
+            if (httpClient != null && httpClient.BaseAddress != baseUri)
+            {
+                if (_panel != null && _panel.HasActiveTransfers)
                 {
-                    Path.GetDirectoryName(GetType().Assembly.Location),
-                    System.IO.Path.Combine(BepInEx.Paths.BepInExRootPath, "plugins"),
-                    BepInEx.Paths.BepInExRootPath,
-                };
-            }
-            catch
-            {
-                dirs = new[] { Path.GetDirectoryName(GetType().Assembly.Location) };
+                    _configError = "有存档正在传输，请等待完成后再切换服务器";
+                    return false;
+                }
+                httpClient.Dispose();
+                httpClient = null;
+                _publicKey = null;
             }
 
-            foreach (var dir in dirs)
+            if (httpClient == null)
             {
-                if (string.IsNullOrEmpty(dir)) continue;
-                var candidate = Path.Combine(dir, "DSPSavesUploader.exe");
-                if (File.Exists(candidate)) return candidate;
+                // 超时按请求单独设置，避免大分片被全局 30 秒超时打断
+                httpClient = new HttpClient
+                {
+                    Timeout = System.Threading.Timeout.InfiniteTimeSpan,
+                    BaseAddress = baseUri
+                };
+                _publicKey = null;
             }
-            return null;
+
+            return true;
         }
 
-        /// <summary>后台转交任务清单（与上传器约定的格式）</summary>
-        public class BackgroundUploadTask
+        /// <summary>面板在发起列表/传输请求前调用，返回可展示的失败原因。</summary>
+        private bool PrepareConnection(out string error)
         {
-            [JsonProperty("server")]
-            public string Server { get; set; }
-
-            [JsonProperty("userName")]
-            public string UserName { get; set; }
-
-            [JsonProperty("password")]
-            public string Password { get; set; }
-
-            [JsonProperty("logPath")]
-            public string LogPath { get; set; }
-
-            [JsonProperty("files")]
-            public System.Collections.Generic.List<string> Files { get; set; }
-
-            /// <summary>分片大小（MB），上传器按同一规则决定是否分片</summary>
-            [JsonProperty("chunkSizeMB")]
-            public int ChunkSizeMB { get; set; }
-
-            /// <summary>分片阈值（MB），0 表示始终分片</summary>
-            [JsonProperty("chunkThresholdMB")]
-            public int ChunkThresholdMB { get; set; }
+            error = null;
+            if (!RefreshHttpClient())
+            {
+                error = _configError;
+                return false;
+            }
+            return true;
         }
 
         public void OnDestroy()
         {
-            _loopCts?.Cancel();
-            if (_saveWatcher != null)
-            {
-                _saveWatcher.EnableRaisingEvents = false;
-                _saveWatcher.Dispose();
-                _saveWatcher = null;
-            }
-            // 不在这里 Dispose HttpClient：退出 flush 可能仍在后台进行，交给进程回收
+            // 关闭面板并取消未完成的传输；HttpClient 交给进程回收，避免退出时卡住
+            _panel?.Shutdown();
             Logger.LogInfo("RemoteSaves unloaded");
-        }
-
-        /// <summary>
-        /// 建立本地文件 mtime 快照（供运行期变化检测）。下载与双向冲突解决
-        /// 已在启动阶段完成（DownloadSaves + 派发上传器），此处只做纯本地扫描，
-        /// 不再有网络请求与上传，避免与后台上传器重复传输。
-        /// </summary>
-        private Task<bool> UpdateFileSnapshot(string savePath, IEnumerable<string> extensions)
-        {
-            if (!Directory.Exists(savePath)) return Task.FromResult(false);
-
-            var extensionList = extensions.ToArray();
-            foreach (var filePath in Directory.GetFiles(savePath))
-            {
-                if (!ShouldProcessFile(filePath, extensionList)) continue;
-                var fileName = Path.GetFileName(filePath);
-                _fileLastWriteTimes[fileName] = File.GetLastWriteTimeUtc(filePath);
-            }
-
-            Logger.LogInfo($"本地快照建立完成（{_fileLastWriteTimes.Count} 个文件）");
-            return Task.FromResult(true);
-        }
-
-        private List<string> GetChangedFiles(string savePath, IEnumerable<string> extensions)
-        {
-            var changedFiles = new List<string>();
-            if (!Directory.Exists(savePath)) return changedFiles;
-
-            foreach (var filePath in Directory.GetFiles(savePath))
-            {
-                try
-                {
-                    if (!ShouldProcessFile(filePath, extensions)) continue;
-
-                    var fileName = Path.GetFileName(filePath);
-                    var currentLastWrite = File.GetLastWriteTimeUtc(filePath);
-
-                    // 检测到以下情况需要同步：
-                    // 1. 新文件（字典中不存在记录）
-                    // 2. 最后修改时间发生变化
-                    if (!_fileLastWriteTimes.TryGetValue(fileName, out var lastWrite) ||
-                        currentLastWrite > lastWrite)
-                    {
-                        changedFiles.Add(filePath);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.LogWarning($"文件访问异常 [{filePath}]: {ex.Message}");
-                }
-            }
-            return changedFiles;
-        }
-
-        private bool CheckConfig()
-        {
-            return configEnabled.Value &&
-                   !string.IsNullOrEmpty(configServerURL.Value) &&
-                   !string.IsNullOrEmpty(configUsername.Value) &&
-                   !string.IsNullOrEmpty(configPassword.Value);
         }
 
         private string GetSavePath()
@@ -712,6 +332,27 @@ namespace DSPRemoteSaves
         {
             [JsonProperty("files")]
             public List<RemoteFile> Files { get; set; } = new List<RemoteFile>();
+
+            /// <summary>用户配额（字节）；旧服务端不返回，值为 0</summary>
+            [JsonProperty("quotaBytes")]
+            public long QuotaBytes { get; set; }
+
+            [JsonProperty("usedBytes")]
+            public long UsedBytes { get; set; }
+
+            /// <summary>已预留但尚未完成上传的字节数</summary>
+            [JsonProperty("reservedBytes")]
+            public long ReservedBytes { get; set; }
+        }
+
+        /// <summary>云端列表 + 配额快照</summary>
+        public class RemoteListing
+        {
+            public List<RemoteFile> Files = new List<RemoteFile>();
+            public long QuotaBytes;
+            public long UsedBytes;
+            public long ReservedBytes;
+            public bool HasQuota => QuotaBytes > 0;
         }
 
         public class RemoteFile
@@ -810,116 +451,6 @@ namespace DSPRemoteSaves
         }
         #endregion
         #region 核心逻辑
-        private async Task DownloadSaves()
-        {
-            try
-            {
-                // 获取远程文件列表
-                var remoteFiles = await GetRemoteFileList(false);
-                if (remoteFiles == null)
-                {
-                    Logger.LogWarning("无法获取云端存档列表，本次跳过下载");
-                    return;
-                }
-
-                // 获取本地文件索引（文件名不区分大小写）
-                var localFiles = GetLocalFileIndex();
-
-                if (remoteFiles.Count == 0)
-                {
-                    Logger.LogInfo("云端没有任何存档，检查本地是否有需要补传的存档");
-                    UploadMissingOnServer(remoteFiles, localFiles);
-                    return;
-                }
-
-                // 只有本地缺失，或云端确实比本地新时才下载
-                var filesToDownload = remoteFiles.Where(remoteFile =>
-                    ShouldDownloadFile(remoteFile, localFiles)
-                ).ToList();
-
-                if (filesToDownload.Count > 0)
-                {
-                    Logger.LogInfo($"开始下载 {filesToDownload.Count} 个存档文件...");
-
-                    // 控制最大并发数
-                    var semaphore = new SemaphoreSlim(Math.Max(1, configMaxParallelDownloadCount.Value));
-                    var downloadTasks = filesToDownload.Select(async file =>
-                    {
-                        await semaphore.WaitAsync();
-                        try
-                        {
-                            if (await DownloadSingleFile(file).ConfigureAwait(false))
-                            {
-                                Logger.LogInfo($"已下载存档: {file.FileName}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.LogError($"下载文件 {file.FileName} 时出错：{FormatException(ex)}");
-                        }
-                        finally { semaphore.Release(); }
-                    }).ToList();
-
-                    // 等待所有下载任务完成
-                    await Task.WhenAll(downloadTasks);
-                    Logger.LogInfo("所有文件下载完成");
-                }
-                else
-                {
-                    Logger.LogInfo("本地存档均为最新，无需下载");
-                }
-
-                // 启动同步的第二阶段：云端没有、本地有的存档转交后台上传进程
-                UploadMissingOnServer(remoteFiles, localFiles);
-            }
-            catch (Exception e)
-            {
-                Logger.LogError($"存档下载失败: {FormatException(e)}");
-            }
-        }
-
-        /// <summary>
-        /// 启动同步的冲突解决阶段（双向，以 mtime 更新的一方为准）：
-        ///   - 云端缺失的本地存档 → 上传
-        ///   - 本地比云端新的存档 → 上传覆盖云端（旧版本仍在，可回退）
-        ///   - 云端比本地新的     → 已在下载阶段处理
-        ///   - 时间接近（容差内） → 视为相同，不动
-        /// 命中的文件全部转交独立上传器进程，游戏进程内不做大流量传输。
-        /// </summary>
-        private void UploadMissingOnServer(
-            List<RemoteFile> remoteFiles,
-            Dictionary<string, FileInfo> localFiles)
-        {
-            var remoteIndex = new Dictionary<string, RemoteFile>(StringComparer.OrdinalIgnoreCase);
-            foreach (var f in remoteFiles ?? new List<RemoteFile>())
-            {
-                if (!string.IsNullOrEmpty(f?.FileName)) remoteIndex[f.FileName] = f;
-            }
-
-            var toUpload = new List<string>();
-            foreach (var info in localFiles.Values.OrderBy(i => i.LastWriteTimeUtc))
-            {
-                if (!remoteIndex.TryGetValue(info.Name, out var remote))
-                {
-                    toUpload.Add(info.FullName);                       // 云端缺失
-                    continue;
-                }
-                var localMs = ToUnixMs(info.LastWriteTimeUtc);
-                // 云端无时间戳（旧服务端）时保持保守：不覆盖
-                if (remote.LastModified > 0 && localMs > remote.LastModified + ClockToleranceMs)
-                    toUpload.Add(info.FullName);                       // 本地更新
-            }
-
-            if (toUpload.Count == 0)
-            {
-                Logger.LogInfo("云端与本地存档一致，无需补传");
-                return;
-            }
-
-            Logger.LogInfo($"云端缺失或本地更新的存档共 {toUpload.Count} 个，转交后台上传进程...");
-            HandOffToBackgroundUploader(toUpload);
-        }
-
         /// <summary>
         /// 生成本地文件索引（文件名小写格式）
         /// </summary>
@@ -956,21 +487,10 @@ namespace DSPRemoteSaves
         }
 
         /// <summary>
-        /// 判断是否需要下载：本地缺失，或云端时间戳比本地新（带时钟容差）
+        /// 下载单个存档到本地。onProgress 报告本次读取的字节数（增量），
+        /// 取消由面板行的 CancellationToken 控制；覆盖前自动备份。
         /// </summary>
-        private bool ShouldDownloadFile(RemoteFile remoteFile, Dictionary<string, FileInfo> localIndex)
-        {
-            if (configDownloadAll.Value) return true;
-
-            var lowerName = remoteFile.FileName.ToLowerInvariant();
-            if (!localIndex.TryGetValue(lowerName, out var localFile)) return true;
-
-            var localMtime = ToUnixMs(localFile.LastWriteTimeUtc);
-            // 旧版服务端不返回 lastModified（值为 0）时退回“本地存在即跳过”，避免误覆盖
-            return remoteFile.LastModified > 0 && remoteFile.LastModified > localMtime + ClockToleranceMs;
-        }
-
-        private async Task<bool> DownloadSingleFile(RemoteFile remoteFile)
+        private async Task<bool> DownloadSingleFile(RemoteFile remoteFile, Action<long> onProgress, CancellationToken token)
         {
             var fileName = remoteFile.FileName;
             var savePath = GetSavePath();
@@ -986,10 +506,11 @@ namespace DSPRemoteSaves
                     FileName = fileName,
                     IsChunk = false
                 };
-                Logger.LogInfo($"下载存档 {payload.UserName}/{payload.FileName}...");
+                Logger.LogInfo($"开始下载存档 {payload.UserName}/{payload.FileName}");
 
                 // 用 ResponseHeadersRead 流式落盘，避免把整个存档先读进内存
-                using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                cts.CancelAfter(TimeSpan.FromMinutes(30));
                 using var response = await PostSealedStreamAsync(payload, "/download/download", cts.Token)
                     .ConfigureAwait(false);
 
@@ -1006,7 +527,14 @@ namespace DSPRemoteSaves
                 using (var fileStream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
                 using (var source = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
                 {
-                    await source.CopyToAsync(fileStream, 81920, cts.Token).ConfigureAwait(false);
+                    var buffer = new byte[81920];
+                    while (true)
+                    {
+                        int read = await source.ReadAsync(buffer, 0, buffer.Length, cts.Token).ConfigureAwait(false);
+                        if (read <= 0) break;
+                        await fileStream.WriteAsync(buffer, 0, read, cts.Token).ConfigureAwait(false);
+                        onProgress?.Invoke(read);
+                    }
                 }
 
                 var downloadedLength = new FileInfo(tempPath).Length;
@@ -1021,7 +549,17 @@ namespace DSPRemoteSaves
                 if (File.Exists(destPath))
                 {
                     BackupLocalFile(destPath);
-                    File.Replace(tempPath, destPath, null);
+                    try
+                    {
+                        File.Replace(tempPath, destPath, null);
+                    }
+                    catch (Exception replaceEx)
+                    {
+                        // 某些文件系统不支持 Replace，退化为删除后移动
+                        Logger.LogWarning($"File.Replace 失败，改用移动覆盖: {replaceEx.Message}");
+                        File.Delete(destPath);
+                        File.Move(tempPath, destPath);
+                    }
                 }
                 else
                 {
@@ -1034,9 +572,20 @@ namespace DSPRemoteSaves
                     File.SetLastWriteTimeUtc(destPath, DateTimeOffset.FromUnixTimeMilliseconds(remoteFile.LastModified).UtcDateTime);
                 }
 
-                _fileLastWriteTimes[Path.GetFileName(destPath)] = File.GetLastWriteTimeUtc(destPath);
                 Logger.LogInfo($"下载完成 {payload.UserName}/{payload.FileName}");
                 return true;
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                Logger.LogInfo($"已取消下载: {fileName}");
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                Logger.LogError($"下载超时: {fileName}");
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                return false;
             }
             catch (Exception e)
             {
@@ -1067,22 +616,17 @@ namespace DSPRemoteSaves
         }
 
 
-        private async Task<List<RemoteFile>> GetRemoteFileList(bool all = false)
+        /// <summary>拉取云端存档列表与配额；失败返回 null（日志中保留原因）。</summary>
+        private async Task<RemoteListing> GetRemoteFileList()
         {
             try
             {
-                var payload = all
-                    ? new FileListRequest
-                    {
-                        UserName = configUsername.Value,
-                        Password = configPassword.Value,
-                    }
-                    : new FileListRequest
-                    {
-                        UserName = configUsername.Value,
-                        Password = configPassword.Value,
-                        SyncFileExtensions = GetFileExtensions().ToList()
-                    };
+                var payload = new FileListRequest
+                {
+                    UserName = configUsername.Value,
+                    Password = configPassword.Value,
+                    SyncFileExtensions = GetFileExtensions().ToList()
+                };
 
                 using var response = await PostSealed("/download/file-list", payload).ConfigureAwait(false);
                 if (!response.IsSuccessStatusCode)
@@ -1097,7 +641,14 @@ namespace DSPRemoteSaves
                 switch (result?.Code)
                 {
                     case 0:
-                        return result.Payload?.Files ?? new List<RemoteFile>();
+                        var payloadData = result.Payload ?? new FileListPayload();
+                        return new RemoteListing
+                        {
+                            Files = payloadData.Files ?? new List<RemoteFile>(),
+                            QuotaBytes = payloadData.QuotaBytes,
+                            UsedBytes = payloadData.UsedBytes,
+                            ReservedBytes = payloadData.ReservedBytes
+                        };
 
                     default:
                         await HandleErrorResponse(response).ConfigureAwait(false);
@@ -1111,22 +662,38 @@ namespace DSPRemoteSaves
             }
         }
 
-        private async Task<bool> UploadSingleFile(string filePath)
+        /// <summary>
+        /// 上传单个存档。onProgress 报告每个分片成功后的字节数（增量），
+        /// 取消会中断后续分片并丢弃本次上传会话（服务端按 TTL 清理）。
+        /// </summary>
+        private async Task<bool> UploadSingleFile(string filePath, Action<long> onProgress, CancellationToken token)
         {
             try
             {
+                token.ThrowIfCancellationRequested();
                 var fileName = Path.GetFileName(filePath);
                 var fileInfo = new FileInfo(filePath);
 
                 // 初始化上传
                 var (fileId, chunkSize, uploadToken) = await InitUpload(fileName, fileInfo.Length).ConfigureAwait(false);
                 if (string.IsNullOrEmpty(fileId)) return false;
+                token.ThrowIfCancellationRequested();
 
                 // 上传分片
-                if (!await UploadChunks(filePath, fileId, chunkSize, uploadToken)) return false;
+                if (!await UploadChunks(filePath, fileId, chunkSize, uploadToken, onProgress, token).ConfigureAwait(false))
+                {
+                    return false;
+                }
+
+                token.ThrowIfCancellationRequested();
 
                 // 完成上传
                 return await CompleteUpload(fileId).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                Logger.LogInfo($"已取消上传: {Path.GetFileName(filePath)}");
+                throw;
             }
             catch (Exception e)
             {
@@ -1186,7 +753,13 @@ namespace DSPRemoteSaves
             return configChunkSize.Value * 1024 * 1024;
         }
 
-        private async Task<bool> UploadChunks(string filePath, string fileId, int chunkSize, string uploadToken)
+        private async Task<bool> UploadChunks(
+            string filePath,
+            string fileId,
+            int chunkSize,
+            string uploadToken,
+            Action<long> onProgress,
+            CancellationToken token)
         {
             try
             {
@@ -1213,7 +786,7 @@ namespace DSPRemoteSaves
                 // 并行处理配置
                 var semaphore = new SemaphoreSlim(Math.Max(1, configMaxChunkParallelUploadCount.Value));
                 var failedChunks = new ConcurrentBag<int>();
-                using var cts = new CancellationTokenSource();
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
 
                 // 并行上传任务
                 var uploadTasks = chunkMetadata.Select(async meta =>
@@ -1263,10 +836,15 @@ namespace DSPRemoteSaves
                             failedChunks.Add(meta.Index);
                             cts.Cancel();
                         }
+                        else
+                        {
+                            // 分片是并行完成的，进度按累计字节数上报
+                            onProgress?.Invoke(meta.ChunkLength);
+                        }
                     }
                     catch (OperationCanceledException)
                     {
-                        // 其他分片失败会取消整个文件；若是本分片超时则单独记录
+                        // 用户取消或同文件其他分片失败：不再记录为超时
                         if (!cts.IsCancellationRequested)
                         {
                             Logger.LogError($"分片{meta.Index}上传超时");
@@ -1295,6 +873,11 @@ namespace DSPRemoteSaves
                     // 具体错误已在各任务中处理
                 }
 
+                if (token.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(token);
+                }
+
                 if (!failedChunks.IsEmpty)
                 {
                     Logger.LogError($"以下分片上传失败: {string.Join(", ", failedChunks)}");
@@ -1303,6 +886,10 @@ namespace DSPRemoteSaves
 
                 Logger.LogInfo($"成功上传 {totalChunks} 个分片");
                 return true;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception e)
             {
@@ -1377,6 +964,10 @@ namespace DSPRemoteSaves
                 try
                 {
                     var errorResponse = new CustomJsonSerializer().Deserialize<UploadCompleteResponse>(responseString);
+                    if (!string.IsNullOrEmpty(errorResponse?.Message))
+                    {
+                        _lastServerError = errorResponse.Message;
+                    }
                     errorMessage.AppendLine($"错误码: {errorResponse?.Code}")
                                .AppendLine($"错误信息: {errorResponse?.Message}");
 

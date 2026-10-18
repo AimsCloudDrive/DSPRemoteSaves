@@ -581,7 +581,14 @@ async fn file_list_inner(
         })
         .collect();
 
-    Ok(legacy_ok(Some(json!({ "files": files }))))
+    // 附带配额快照：游戏内面板需要显示“云空间 x / y”，
+    // 旧客户端会忽略这些新增字段。
+    Ok(legacy_ok(Some(json!({
+        "files": files,
+        "quotaBytes": user.quota_bytes,
+        "usedBytes": user.used_bytes,
+        "reservedBytes": user.reserved_bytes,
+    }))))
 }
 
 // ---------------------------------------------------------------------------
