@@ -439,20 +439,12 @@ namespace DSPRemoteSaves
                 };
                 File.WriteAllText(taskPath, new CustomJsonSerializer().Serialize(task));
 
-                // 用 WMI Win32_Process.Create 启动：进程由 WMI 服务创建，
-                // 不属于游戏进程树，也不在游戏的 Job 对象内 —— 游戏退出、
-                // Steam/r2modman 的 Job 清理都不会连带杀死上传器。
-                var wmi = new System.Management.ManagementClass("Win32_Process");
-                var inParams = wmi.GetMethodParameters("Create");
-                inParams["CommandLine"] = $"\"{exePath}\" --task \"{taskPath}\"";
-                inParams["CurrentDirectory"] = Path.GetDirectoryName(exePath);
-                var outParams = wmi.InvokeMethod("Create", inParams, null);
-                var ret = Convert.ToInt32(outParams["ReturnValue"]);
-                if (ret != 0)
-                {
-                    Logger.LogWarning($"后台上传进程创建失败（WMI 返回 {ret}），未完成的存档会在下次启动时重新上传");
-                    return;
-                }
+                // 通过 explorer.exe 中介启动：进程归属于 Shell，不在游戏进程树/Job 对象内，
+                // 游戏退出、Steam/r2modman 的 Job 清理都不会连带杀死上传器。
+                // 上传器以无参模式启动，自动扫描约定目录（exe 同目录 DSPRemoteSaves/）
+                // 下的 pending-upload-*.json —— 刚写入的任务清单会被立即处理。
+                // 注：不能用 WMI（Unity Mono 不带 System.Management）。
+                System.Diagnostics.Process.Start("explorer.exe", $"\"{exePath}\"");
                 Logger.LogInfo($"已转交后台上传进程（{files.Count} 个存档继续上传），游戏即将退出");
             }
             catch (Exception ex)
