@@ -225,6 +225,7 @@ namespace DSPSavesUploader
             using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
                 var buffer = new byte[chunkSize];
+                var progressEvery = Math.Max(1, totalChunks / 8);
                 for (long index = 0; index < totalChunks; index++)
                 {
                     var read = fs.Read(buffer, 0, buffer.Length);
@@ -241,6 +242,8 @@ namespace DSPSavesUploader
                             var text = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                             if (!resp.IsSuccessStatusCode || ExtractLong(text, "code") != 0)
                                 throw new Exception($"chunk {index} 失败: HTTP {(int)resp.StatusCode} {Trim(text, 200)}");
+                            if ((index + 1) % progressEvery == 0 || index + 1 == totalChunks)
+                                Log($"进度 {fileName} 分片 {index + 1}/{totalChunks}");
                         }
                     }
                 }
