@@ -963,6 +963,8 @@ async fn get_settings(
     Ok(ok(json!({
         "defaultQuotaBytes": settings.default_quota_bytes,
         "maxFileSize": settings.max_file_size,
+        // 服务端硬上限（配置文件 storage.max_file_size），超出该值的设置不会生效
+        "serverMaxFileSize": state.cfg.storage.max_file_size,
         "allowedExtensions": settings.allowed_extensions,
         "updatedAt": dt_ms(settings.updated_at),
     })))
@@ -992,8 +994,15 @@ async fn put_settings(
         settings.default_quota_bytes = quota;
     }
     if let Some(max) = req.max_file_size {
-        if max <= 0 || max > 10 * 1024 * 1024 * 1024 {
+        if max <= 0 {
             return Err(AppError::invalid("invalid max file size"));
+        }
+        // 超过配置文件里的硬上限会被 effective_max_file_size() 夹回去，这里直接拒绝，避免"设置了却没效果"
+        if max > state.cfg.storage.max_file_size {
+            return Err(AppError::invalid(format!(
+                "max file size exceeds server limit ({} bytes)",
+                state.cfg.storage.max_file_size
+            )));
         }
         settings.max_file_size = max;
     }

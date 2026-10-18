@@ -16,7 +16,10 @@
             <el-input-number v-model="form.quotaGb" :min="0.1" :step="0.5" :precision="2" style="width: 220px" />
           </el-form-item>
           <el-form-item :label="`${t('settings.maxFileSize')} (GB)`">
-            <el-input-number v-model="form.maxFileGb" :min="1" :max="10" :step="1" style="width: 220px" />
+            <el-input-number v-model="form.maxFileGb" :min="0.5" :max="serverMaxGb" :step="0.5" :precision="2" style="width: 220px" />
+            <div class="dsp-muted" style="font-size: 12px; margin-top: 4px">
+              {{ t('settings.maxFileSizeHint', { size: `${serverMaxGb} GB` }) }}
+            </div>
           </el-form-item>
           <el-form-item :label="t('settings.allowedExtensions')">
             <el-input v-model="form.extensions" :placeholder="t('settings.extensionsHint')" />
@@ -62,6 +65,7 @@ import { formatTime } from '../utils/format'
 interface Settings {
   defaultQuotaBytes: number
   maxFileSize: number
+  serverMaxFileSize?: number
   allowedExtensions: string[]
 }
 
@@ -76,6 +80,8 @@ const saving = ref(false)
 const rotating = ref(false)
 const overview = ref<Overview | null>(null)
 const form = reactive({ quotaGb: 1, maxFileGb: 2, extensions: '.dsv,.moddsv,.server' })
+// 服务端硬上限（config.server.toml 的 storage.max_file_size），管理端设置不能超过它
+const serverMaxGb = ref(10)
 
 async function load() {
   loading.value = true
@@ -86,6 +92,9 @@ async function load() {
     ])
     form.quotaGb = Number((settings.defaultQuotaBytes / 1024 ** 3).toFixed(2))
     form.maxFileGb = Number((settings.maxFileSize / 1024 ** 3).toFixed(2))
+    if (settings.serverMaxFileSize && settings.serverMaxFileSize > 0) {
+      serverMaxGb.value = Number((settings.serverMaxFileSize / 1024 ** 3).toFixed(2))
+    }
     form.extensions = settings.allowedExtensions.join(',')
     overview.value = stats
   } catch (error) {

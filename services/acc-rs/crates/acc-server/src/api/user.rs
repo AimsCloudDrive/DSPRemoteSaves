@@ -416,6 +416,8 @@ async fn stats(
         "reservedBytes": profile.reserved_bytes,
         "fileCount": saves.len(),
         "versionCount": versions,
+        // 当前生效的单文件上限（管理端设置，受配置文件硬上限约束）
+        "maxFileSize": state.effective_max_file_size().await,
         "diskFreeBytes": state.storage.available_space(),
         "serverTime": now_ms(),
     })))

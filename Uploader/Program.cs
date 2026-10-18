@@ -27,6 +27,12 @@ namespace DSPSavesUploader
     internal static class Program
     {
         private const int MaxAttemptsPerFile = 2;
+        /// <summary>服务端允许的最小分片（chunk_size 下限 64KB）</summary>
+        private const int MinChunkBytes = 64 * 1024;
+        /// <summary>服务端允许的单个分片上限（storage.max_chunk_size 默认 64MB）</summary>
+        private const int MaxSingleChunkBytes = 64 * 1024 * 1024;
+        /// <summary>旧清单（插件未写 chunkSizeMB）时沿用的分片大小</summary>
+        private const int DefaultChunkSizeMB = 4;
         private static readonly TimeSpan NewTaskWait = TimeSpan.FromSeconds(20);
         private static Mutex _singleInstance;
         private static TextWriter _log = Console.Out;
@@ -173,6 +179,12 @@ namespace DSPSavesUploader
                     var password = ExtractString(json, "password");
                     var files = ExtractStringArray(json, "files");
 
+                    // 分片参数由插件写入；旧清单没有这两个字段，沿用分片上传的旧行为
+                    var chunkSizeMB = ExtractLong(json, "chunkSizeMB");
+                    var chunkThresholdMB = ExtractLong(json, "chunkThresholdMB");
+                    if (chunkSizeMB <= 0 || chunkSizeMB > 64) chunkSizeMB = DefaultChunkSizeMB;
+                    if (chunkThresholdMB < 0 || chunkThresholdMB > 64) chunkThresholdMB = 0;
+
                     if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(user) || files.Count == 0)
                     {
                         Log($"任务清单不完整，跳过: {Path.GetFileName(taskPath)}");
@@ -207,7 +219,7 @@ namespace DSPSavesUploader
                                     break;
                                 }
 
-                                UploadOne(serverUrl, user, password, pk, file).GetAwaiter().GetResult();
+                                UploadOne(serverUrl, user, password, pk, file, chunkSizeMB, chunkThresholdMB).GetAwaiter().GetResult();
                                 done = true;
                                 ok++;
                             }
@@ -256,16 +268,30 @@ namespace DSPSavesUploader
             return info;
         }
 
-        private static async Task UploadOne(string server, string user, string password, PublicKeyInfo pk, string filePath)
+        /// <summary>
+        /// 与插件的 ResolveChunkSize 保持一致：文件不超过阈值时整块上传（服务端算出 1 个分片），
+        /// 超过阈值才按 chunkSizeMB 切分；chunkSize 会被夹到服务端的 [64KB, 64MB] 区间。
+        /// </summary>
+        private static long ResolveChunkSize(long fileSize, long chunkSizeMB, long chunkThresholdMB)
+        {
+            var thresholdBytes = chunkThresholdMB * 1024 * 1024;
+            if (thresholdBytes > 0 && fileSize > 0 && fileSize <= thresholdBytes && fileSize <= MaxSingleChunkBytes)
+                return Math.Max(MinChunkBytes, fileSize);
+            return chunkSizeMB * 1024 * 1024;
+        }
+
+        private static async Task UploadOne(string server, string user, string password, PublicKeyInfo pk, string filePath,
+            long chunkSizeMB, long chunkThresholdMB)
         {
             var fileName = Path.GetFileName(filePath);
             var size = new FileInfo(filePath).Length;
+            var requestChunkSize = ResolveChunkSize(size, chunkSizeMB, chunkThresholdMB);
 
             // 1) init（每请求独立信封，与插件 SealAsync 一致）
             var seal = Seal(pk.PublicKey, password);
             var initBody = "{\"userName\":\"" + Esc(user) + "\",\"password\":\"" + Esc(seal.Cipher) +
                            "\",\"fileName\":\"" + Esc(fileName) + "\",\"fileSize\":" + size +
-                           ",\"chunkSize\":" + (4 * 1024 * 1024) +
+                           ",\"chunkSize\":" + requestChunkSize +
                            ",\"timestamp\":" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() +
                            ",\"nonce\":\"" + Guid.NewGuid().ToString("N") + "\"}";
             var initResp = await PostJson(server + "upload/init", initBody, seal.Smkey, pk.KeyId).ConfigureAwait(false);

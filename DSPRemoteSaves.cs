@@ -23,7 +23,7 @@ namespace DSPRemoteSaves
     {
         public const string GUID = "com.aims.remotesaves";
         public const string NAME = "RemoteSaves";
-        public const string VERSION = "2.1.0";
+        public const string VERSION = "2.1.1";
         public const string GAME_PROCESS = "DSPGAME.exe";
 
         #region Config Settings
@@ -33,6 +33,7 @@ namespace DSPRemoteSaves
         private ConfigEntry<bool> configDownloadAll;
         private ConfigEntry<string> configFileExtensions;
         private ConfigEntry<int> configChunkSize;
+        private ConfigEntry<int> configChunkThresholdMB;
         private ConfigEntry<bool> configEnabled;
         private ConfigEntry<int> configMaxParallelDownloadCount;
         private ConfigEntry<int> configMaxParallelUploadCount;
@@ -44,6 +45,10 @@ namespace DSPRemoteSaves
 
         /// <summary>云端与本地时间戳比较时允许的误差（毫秒）</summary>
         private const long ClockToleranceMs = 2000;
+        /// <summary>服务端允许的最小分片（对应 acc-server 的 chunk_size 下限 64KB）</summary>
+        private const int MinChunkBytes = 64 * 1024;
+        /// <summary>服务端允许的单个分片上限（对应 storage.max_chunk_size 默认值 64MB），超过只能分片</summary>
+        private const int MaxSingleChunkBytes = 64 * 1024 * 1024;
         /// <summary>启动时最多阻塞主线程等待首次下载的时间</summary>
 
         private HttpClient httpClient;
@@ -101,6 +106,9 @@ namespace DSPRemoteSaves
                 new ConfigDescription("单个文件上传时的最大并行任务数", new AcceptableValueRange<int>(1, 3)));
             configChunkSize = Config.Bind("Performance", "ChunkSize(MB)", 5,
                 new ConfigDescription("大文件分块上传时每个分块的大小（单位：MB）", new AcceptableValueRange<int>(5, 50)));
+            configChunkThresholdMB = Config.Bind("Performance", "ChunkThreshold(MB)", 5,
+                new ConfigDescription("分片阈值（单位：MB）：不超过该大小的文件整块上传（只有 1 个分片），超过该大小才按 ChunkSize(MB) 切分。设为 0 表示始终分片；服务端单分片上限 64MB，超过 64MB 的文件始终分片",
+                    new AcceptableValueRange<int>(0, 64)));
             configMaxChunkParallelUploadCount = Config.Bind("Performance", "MaxChunkParallelUploadCount", 5,
                 new ConfigDescription("单个文件分块上传时的最大并行分块数", new AcceptableValueRange<int>(1, 10)));
             configMaxParallelDownloadCount = Config.Bind("Performance", "MaxParallelDownloadCount", 5,
@@ -108,9 +116,9 @@ namespace DSPRemoteSaves
             configCheckInterval = Config.Bind("Performance", "CheckInterval(s)", 5 * 60,
                 new ConfigDescription("本地存档变更检测间隔（单位：秒）。保存后由文件监视立即触发，此间隔仅作为兜底扫描", new AcceptableValueRange<int>(10, 15 * 60)));
             configExitBackgroundUpload = Config.Bind("Performance", "ExitBackgroundUpload", true,
-                 new ConfigDescription("退出时未传完的存档转交独立进程（DSPSavesUploader.exe）后台上传，游戏立即退出；关闭则只等待 ExitSyncTimeout(s)"));
+                 new ConfigDescription("退出时把待同步存档直接转交独立进程（DSPSavesUploader.exe）后台上传，游戏立刻退出、界面不卡死；关闭或上传器缺失时才在退出前同步，最多等待 ExitSyncTimeout(s)"));
             configExitSyncTimeout = Config.Bind("Performance", "ExitSyncTimeout(s)", 20,
-                new ConfigDescription("退出游戏前等待最后一次上传的最长时间（单位：秒）", new AcceptableValueRange<int>(3, 120)));
+                new ConfigDescription("未启用后台上传时，退出游戏前等待最后一次上传的最长时间（单位：秒，会阻塞主线程）", new AcceptableValueRange<int>(3, 120)));
 
             Config.Save();
         }
@@ -326,7 +334,10 @@ namespace DSPRemoteSaves
             catch (SemaphoreFullException) { }
         }
 
-        /// <summary>游戏退出前做最后一次同步（旧版只取消循环，最后几分钟的存档会丢）</summary>
+        /// <summary>
+        /// 游戏退出前做最后一次同步。默认**不阻塞主线程**：把待同步清单直接转交独立上传进程，
+        /// 游戏立刻退出；只有关闭后台上传（或找不到上传器）时才在进程内等待，受 ExitSyncTimeout 限制。
+        /// </summary>
         public void OnApplicationQuit()
         {
             if (!CheckConfig()) return;
@@ -335,20 +346,39 @@ namespace DSPRemoteSaves
             _loopCts?.Cancel();
             if (_saveWatcher != null) _saveWatcher.EnableRaisingEvents = false;
 
-            var lockTaken = false;
             try
             {
-                // 等正在进行的同步结束，避免同一文件被并发上传
-                lockTaken = _syncLock.Wait(TimeSpan.FromSeconds(3));
-
-                var savePath = GetSavePath();
-                var extensions = GetFileExtensions();
-                var changedFiles = GetChangedFiles(savePath, extensions);
+                var changedFiles = GetChangedFiles(GetSavePath(), GetFileExtensions());
                 if (changedFiles.Count == 0)
                 {
                     Logger.LogInfo("退出前没有待同步的存档");
                     return;
                 }
+
+                // 优先转交后台进程：退出路径上不做任何网络等待，避免 Unity 主线程卡死（游戏未响应）
+                if (configExitBackgroundUpload.Value)
+                {
+                    Logger.LogInfo($"退出前发现 {changedFiles.Count} 个存档待同步，转交后台上传进程");
+                    if (HandOffToBackgroundUploader(changedFiles)) return;
+                    Logger.LogWarning("转交后台上传进程失败，改为退出前同步");
+                }
+
+                FlushOnExit(changedFiles);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"退出同步失败: {FormatException(ex)}");
+            }
+        }
+
+        /// <summary>进程内退出同步：会阻塞主线程，仅在无法使用后台上传时调用</summary>
+        private void FlushOnExit(System.Collections.Generic.List<string> changedFiles)
+        {
+            var lockTaken = false;
+            try
+            {
+                // 等正在进行的同步结束，避免同一文件被并发上传
+                lockTaken = _syncLock.Wait(TimeSpan.FromSeconds(3));
 
                 var timeout = TimeSpan.FromSeconds(Math.Max(3, configExitSyncTimeout.Value));
                 Logger.LogInfo($"退出前同步 {changedFiles.Count} 个存档（最多等待 {timeout.TotalSeconds:0} 秒）");
@@ -396,10 +426,6 @@ namespace DSPRemoteSaves
                     Logger.LogWarning("后台转交未启用，未完成的存档会在下次启动时重新上传");
                 }
             }
-            catch (AggregateException ae)
-            {
-                foreach (var e in ae.InnerExceptions) Logger.LogError($"退出同步失败: {FormatException(e)}");
-            }
             catch (Exception ex)
             {
                 Logger.LogError($"退出同步失败: {FormatException(ex)}");
@@ -413,8 +439,9 @@ namespace DSPRemoteSaves
         /// <summary>
         /// 把未完成的存档清单写入任务文件并启动独立上传进程，
         /// 游戏退出后由该进程继续上传（进程间无父子绑定，不受游戏退出影响）。
+        /// 返回 false 表示上传器缺失或启动失败，调用方可退回进程内同步。
         /// </summary>
-        private void HandOffToBackgroundUploader(System.Collections.Generic.List<string> files)
+        private bool HandOffToBackgroundUploader(System.Collections.Generic.List<string> files)
         {
             try
             {
@@ -422,7 +449,7 @@ namespace DSPRemoteSaves
                 if (string.IsNullOrEmpty(exePath))
                 {
                     Logger.LogWarning("未找到 DSPSavesUploader.exe（放在 BepInEx/plugins 下即可），未完成的存档会在下次启动时重新上传");
-                    return;
+                    return false;
                 }
 
                 var taskDir = Path.Combine(Path.GetDirectoryName(exePath), "DSPRemoteSaves");
@@ -436,6 +463,8 @@ namespace DSPRemoteSaves
                     Password = configPassword.Value,
                     LogPath = Path.Combine(taskDir, "uploader.log"),
                     Files = files,
+                    ChunkSizeMB = configChunkSize.Value,
+                    ChunkThresholdMB = configChunkThresholdMB.Value,
                 };
                 File.WriteAllText(taskPath, new CustomJsonSerializer().Serialize(task));
 
@@ -445,11 +474,13 @@ namespace DSPRemoteSaves
                 // 下的 pending-upload-*.json —— 刚写入的任务清单会被立即处理。
                 // 注：不能用 WMI（Unity Mono 不带 System.Management）。
                 System.Diagnostics.Process.Start("explorer.exe", $"\"{exePath}\"");
-                Logger.LogInfo($"已转交后台上传进程（{files.Count} 个存档继续上传），游戏即将退出");
+                Logger.LogInfo($"已转交后台上传进程（{files.Count} 个存档继续上传）");
+                return true;
             }
             catch (Exception ex)
             {
                 Logger.LogWarning($"后台上传转交失败，未完成的存档会在下次启动时重新上传: {FormatException(ex)}");
+                return false;
             }
         }
 
@@ -497,6 +528,14 @@ namespace DSPRemoteSaves
 
             [JsonProperty("files")]
             public System.Collections.Generic.List<string> Files { get; set; }
+
+            /// <summary>分片大小（MB），上传器按同一规则决定是否分片</summary>
+            [JsonProperty("chunkSizeMB")]
+            public int ChunkSizeMB { get; set; }
+
+            /// <summary>分片阈值（MB），0 表示始终分片</summary>
+            [JsonProperty("chunkThresholdMB")]
+            public int ChunkThresholdMB { get; set; }
         }
 
         public void OnDestroy()
@@ -1099,13 +1138,14 @@ namespace DSPRemoteSaves
         {
             try
             {
+                var chunkSize = ResolveChunkSize(fileSize);
                 var initPayload = new UploadInitRequest
                 {
                     UserName = configUsername.Value,
                     Password = configPassword.Value,
                     FileName = fileName,
                     FileSize = fileSize,
-                    ChunkSize = configChunkSize.Value * 1024 * 1024
+                    ChunkSize = chunkSize
                 };
 
                 using var response = await PostSealed("/upload/init", initPayload).ConfigureAwait(false);
@@ -1126,6 +1166,26 @@ namespace DSPRemoteSaves
                 return (null, 0, null);
             }
         }
+
+        /// <summary>
+        /// 按文件大小决定 init 时上报的分片大小：
+        /// 文件不超过 ChunkThreshold(MB) 时整块上传（服务端算出 totalChunks=1，不切分）；
+        /// 超过阈值则按 ChunkSize(MB) 切分。
+        /// 服务端要求 64KB ≤ chunkSize ≤ max_chunk_size（默认 64MB），单块大小会被夹到该区间。
+        /// </summary>
+        private int ResolveChunkSize(long fileSize)
+        {
+            var thresholdBytes = (long)configChunkThresholdMB.Value * 1024 * 1024;
+            if (thresholdBytes > 0 && fileSize > 0 &&
+                fileSize <= thresholdBytes && fileSize <= MaxSingleChunkBytes)
+            {
+                // 整块上传：chunkSize 取文件自身大小，服务端即得 1 个分片
+                Logger.LogDebug($"文件 {fileSize / 1024.0 / 1024.0:0.00}MB 未超过分片阈值 {configChunkThresholdMB.Value}MB，整块上传");
+                return (int)Math.Max(MinChunkBytes, fileSize);
+            }
+            return configChunkSize.Value * 1024 * 1024;
+        }
+
         private async Task<bool> UploadChunks(string filePath, string fileId, int chunkSize, string uploadToken)
         {
             try

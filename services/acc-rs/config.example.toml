@@ -55,7 +55,8 @@ timestamp_tolerance_seconds = 300
 
 [storage]
 saves_dir = "/app/saves"
-max_file_size = 2147483648
+# 单文件硬上限（管理端只能在此范围内调整；大文件走分片，不受通用请求体 16MB 限制）
+max_file_size = 10737418240
 max_chunk_size = 67108864
 max_total_chunks = 20000
 min_free_bytes = 2147483648

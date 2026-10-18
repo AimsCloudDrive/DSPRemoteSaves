@@ -42,6 +42,19 @@ cd services/acc-rs && cargo build -p acc-server -p acc-cli
 cd services/acc-rs/web && npm install && npm run build
 ```
 
+## 模组配置
+
+配置文件：`BepInEx/config/com.aims.remotesaves.cfg`（首次启动自动生成，缺项自动补写）。
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `Server` / `Remote ServerURL` | 空 | 服务器地址，**不带** API 路径 |
+| `User` / `Username`、`Password` | 空 | 账号密码（密码国密封装传输） |
+| `Performance` / `ChunkThreshold(MB)` | `5` | **分片阈值**：不超过该大小的文件整块上传（只有 1 个分片），超过才按 `ChunkSize(MB)` 切分；`0` = 始终分片；上限 64（服务端单分片上限） |
+| `Performance` / `ChunkSize(MB)` | `5` | 单个分片大小 |
+| `Performance` / `MaxChunkParallelUploadCount` | `5` | 单文件并行分片数 |
+| `Performance` / `ForceDownloadAll` | `false` | `true` 时云端强制覆盖本地（覆盖前备份） |
+
 ## 测试
 
 ```bash

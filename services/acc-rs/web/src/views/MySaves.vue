@@ -22,7 +22,7 @@
       :title="t('saves.uploadProgress', { n: progress })"
       style="margin-bottom: 14px"
     />
-    <el-alert v-else type="info" :closable="false" :title="t('saves.uploadHint')" style="margin-bottom: 14px" />
+    <el-alert v-else type="info" :closable="false" :title="t('saves.uploadHint', { size: formatBytes(maxFileSize) })" style="margin-bottom: 14px" />
 
     <div class="dsp-card" style="padding: 16px">
       <el-table v-loading="loading" :data="data?.files || []" stripe :empty-text="t('saves.emptyMine')">
@@ -127,6 +127,8 @@ interface Version {
 const { t } = useI18n()
 const auth = useAuthStore()
 const data = ref<SaveList | null>(null)
+// 单文件上限由管理端配置，这里从服务端读取后在提示里展示（不再写死 2GB）
+const maxFileSize = ref(2 * 1024 ** 3)
 const loading = ref(false)
 const uploading = ref(false)
 const progress = ref(0)
@@ -151,7 +153,12 @@ function sourceLabel(source: string) {
 async function load() {
   loading.value = true
   try {
-    data.value = await unwrap<SaveList>(api.get('/user/saves'))
+    const [saves, stats] = await Promise.all([
+      unwrap<SaveList>(api.get('/user/saves')),
+      unwrap<{ maxFileSize?: number }>(api.get('/user/stats')),
+    ])
+    data.value = saves
+    if (stats?.maxFileSize && stats.maxFileSize > 0) maxFileSize.value = stats.maxFileSize
   } catch (error) {
     showError(error)
   } finally {
@@ -168,6 +175,12 @@ async function onFilePicked(event: Event) {
   const file = input.files?.[0]
   input.value = ''
   if (!file) return
+  if (maxFileSize.value > 0 && file.size > maxFileSize.value) {
+    ElMessage.error(
+      t('saves.tooLarge', { actual: formatBytes(file.size), size: formatBytes(maxFileSize.value) }),
+    )
+    return
+  }
   uploading.value = true
   progress.value = 0
   try {

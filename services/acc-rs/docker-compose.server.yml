@@ -19,7 +19,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: dsp-saves:2.0.2
+    image: dsp-saves:2.0.3
     container_name: dsp-saves-app
     restart: unless-stopped
     env_file:

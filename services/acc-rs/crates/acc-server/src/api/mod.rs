@@ -100,7 +100,10 @@ async fn api_not_found() -> axum::response::Response {
 
 pub fn build_router(state: AppState) -> Router {
     let base_path = state.cfg.server.base_path.clone();
-    let max_file_size = state.cfg.storage.max_file_size;
+
+    // 通用 JSON 请求体上限，固定 16MB：大文件走 /upload/chunk 与 /user/saves/{name}，
+    // 这两条路由各自用 DefaultBodyLimit::disable() 单独放开，不随单文件上限变化（避免超大门限变成 DoS 面）。
+    const API_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
     let api = Router::new()
         .nest("/auth", auth::routes())
@@ -113,9 +116,7 @@ pub fn build_router(state: AppState) -> Router {
             "/crypto/public-key",
             get(health::public_key).layer(DefaultBodyLimit::max(16 * 1024)),
         )
-        .layer(DefaultBodyLimit::max(
-            (max_file_size.max(16 * 1024 * 1024)) as usize,
-        ))
+        .layer(DefaultBodyLimit::max(API_BODY_LIMIT))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             context_middleware,
