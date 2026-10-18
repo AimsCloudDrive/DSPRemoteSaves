@@ -520,47 +520,25 @@ namespace DSPRemoteSaves
             Logger.LogInfo("RemoteSaves unloaded");
         }
 
-        /// <summary>建立本地快照；本地比云端新的存档会被推上去，云端缺失的也会补传</summary>
-        private async Task<bool> UpdateFileSnapshot(string savePath, IEnumerable<string> extensions)
+        /// <summary>
+        /// 建立本地文件 mtime 快照（供运行期变化检测）。下载与双向冲突解决
+        /// 已在启动阶段完成（DownloadSaves + 派发上传器），此处只做纯本地扫描，
+        /// 不再有网络请求与上传，避免与后台上传器重复传输。
+        /// </summary>
+        private Task<bool> UpdateFileSnapshot(string savePath, IEnumerable<string> extensions)
         {
-            if (!Directory.Exists(savePath)) return false;
-
-            var remoteFiles = await GetRemoteFileList(false).ConfigureAwait(false);
-            if (remoteFiles == null)
-            {
-                Logger.LogWarning("获取云端文件列表失败，跳过本轮初始化");
-                return false;
-            }
-
-            var remoteIndex = new Dictionary<string, RemoteFile>(StringComparer.OrdinalIgnoreCase);
-            foreach (var file in remoteFiles)
-            {
-                if (!string.IsNullOrEmpty(file?.FileName)) remoteIndex[file.FileName] = file;
-            }
+            if (!Directory.Exists(savePath)) return Task.FromResult(false);
 
             var extensionList = extensions.ToArray();
             foreach (var filePath in Directory.GetFiles(savePath))
             {
                 if (!ShouldProcessFile(filePath, extensionList)) continue;
-
                 var fileName = Path.GetFileName(filePath);
-                var localMtime = ToUnixMs(File.GetLastWriteTimeUtc(filePath));
-
-                if (!remoteIndex.TryGetValue(fileName, out var remote) ||
-                    (remote.LastModified > 0 && localMtime > remote.LastModified + ClockToleranceMs))
-                {
-                    if (!await UploadSingleFile(filePath).ConfigureAwait(false))
-                    {
-                        Logger.LogError($"初始上传失败: {fileName}");
-                        return false;
-                    }
-                    Logger.LogInfo($"已上传本地存档: {fileName}");
-                }
-
                 _fileLastWriteTimes[fileName] = File.GetLastWriteTimeUtc(filePath);
             }
 
-            return true;
+            Logger.LogInfo($"本地快照建立完成（{_fileLastWriteTimes.Count} 个文件）");
+            return Task.FromResult(true);
         }
 
         private List<string> GetChangedFiles(string savePath, IEnumerable<string> extensions)
@@ -870,30 +848,45 @@ namespace DSPRemoteSaves
         }
 
         /// <summary>
-        /// 启动同步的补传阶段：扫描本地文件，把云端没有的存档写入任务清单，
-        /// 并转交独立上传器进程上传。游戏进程内不做大流量传输，避免与游戏抢资源。
+        /// 启动同步的冲突解决阶段（双向，以 mtime 更新的一方为准）：
+        ///   - 云端缺失的本地存档 → 上传
+        ///   - 本地比云端新的存档 → 上传覆盖云端（旧版本仍在，可回退）
+        ///   - 云端比本地新的     → 已在下载阶段处理
+        ///   - 时间接近（容差内） → 视为相同，不动
+        /// 命中的文件全部转交独立上传器进程，游戏进程内不做大流量传输。
         /// </summary>
         private void UploadMissingOnServer(
             List<RemoteFile> remoteFiles,
             Dictionary<string, FileInfo> localFiles)
         {
-            var remoteNames = new HashSet<string>(
-                (remoteFiles ?? new List<RemoteFile>()).Select(f => f.FileName.ToLowerInvariant()));
+            var remoteIndex = new Dictionary<string, RemoteFile>(StringComparer.OrdinalIgnoreCase);
+            foreach (var f in remoteFiles ?? new List<RemoteFile>())
+            {
+                if (!string.IsNullOrEmpty(f?.FileName)) remoteIndex[f.FileName] = f;
+            }
 
-            var missing = localFiles.Values
-                .Where(info => !remoteNames.Contains(info.Name.ToLowerInvariant()))
-                .OrderBy(info => info.LastWriteTimeUtc)
-                .Select(info => info.FullName)
-                .ToList();
+            var toUpload = new List<string>();
+            foreach (var info in localFiles.Values.OrderBy(i => i.LastWriteTimeUtc))
+            {
+                if (!remoteIndex.TryGetValue(info.Name, out var remote))
+                {
+                    toUpload.Add(info.FullName);                       // 云端缺失
+                    continue;
+                }
+                var localMs = ToUnixMs(info.LastWriteTimeUtc);
+                // 云端无时间戳（旧服务端）时保持保守：不覆盖
+                if (remote.LastModified > 0 && localMs > remote.LastModified + ClockToleranceMs)
+                    toUpload.Add(info.FullName);                       // 本地更新
+            }
 
-            if (missing.Count == 0)
+            if (toUpload.Count == 0)
             {
                 Logger.LogInfo("云端与本地存档一致，无需补传");
                 return;
             }
 
-            Logger.LogInfo($"云端缺失 {missing.Count} 个本地存档，转交后台上传进程...");
-            HandOffToBackgroundUploader(missing);
+            Logger.LogInfo($"云端缺失或本地更新的存档共 {toUpload.Count} 个，转交后台上传进程...");
+            HandOffToBackgroundUploader(toUpload);
         }
 
         /// <summary>
