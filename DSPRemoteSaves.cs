@@ -1,0 +1,2087 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using BepInEx;
+
+using BepInEx.Configuration;
+using System.Net.Http;
+using System.IO;
+using System.Reflection;
+using System.Threading.Tasks;
+using UnityEngine;
+using System.Collections;
+using System.Threading;
+using System.Collections.Concurrent;
+
+namespace DSPRemoteSaves
+{
+    [BepInPlugin(GUID, NAME, VERSION)]
+    [BepInProcess(GAME_PROCESS)]
+    public class DSPRemoteSaves : BaseUnityPlugin
+    {
+        public const string GUID = "com.aims.remotesaves";
+        public const string NAME = "RemoteSaves";
+        public const string VERSION = "2.1.0";
+        public const string GAME_PROCESS = "DSPGAME.exe";
+
+        #region Config Settings
+        private ConfigEntry<string> configServerURL;
+        private ConfigEntry<string> configUsername;
+        private ConfigEntry<string> configPassword;
+        private ConfigEntry<bool> configDownloadAll;
+        private ConfigEntry<string> configFileExtensions;
+        private ConfigEntry<int> configChunkSize;
+        private ConfigEntry<bool> configEnabled;
+        private ConfigEntry<int> configMaxParallelDownloadCount;
+        private ConfigEntry<int> configMaxParallelUploadCount;
+        private ConfigEntry<int> configMaxChunkParallelUploadCount;
+        private ConfigEntry<int> configCheckInterval;
+        private ConfigEntry<int> configExitSyncTimeout;
+        private ConfigEntry<bool> configExitBackgroundUpload;
+        #endregion Config Settings
+
+        /// <summary>云端与本地时间戳比较时允许的误差（毫秒）</summary>
+        private const long ClockToleranceMs = 2000;
+        /// <summary>启动时最多阻塞主线程等待首次下载的时间</summary>
+        private static readonly TimeSpan InitialDownloadWait = TimeSpan.FromSeconds(10);
+
+        private HttpClient httpClient;
+        /// <summary>服务端 SM2 公钥；启动/首次请求时拉取，收到 2005 时强制刷新</summary>
+        private PublicKeyInfo _publicKey;
+        private DateTime _publicKeyFetchedUtc = DateTime.MinValue;
+        private ConcurrentDictionary<string, DateTime> _fileLastWriteTimes = new ConcurrentDictionary<string, DateTime>();
+        private CancellationTokenSource _loopCts;
+        private FileSystemWatcher _saveWatcher;
+        private readonly SemaphoreSlim _syncSignal = new SemaphoreSlim(0, 1);
+        private readonly SemaphoreSlim _syncLock = new SemaphoreSlim(1, 1);
+        private int _shuttingDown;
+
+        public void Awake()
+        {
+            try
+            {
+                // 配置初始化
+                InitConfig();
+                if (!CheckConfig())
+                {
+                    return;
+                }
+                // 网络客户端初始化：超时改为按请求设置，避免大分片被 30 秒全局超时打断
+                httpClient = new HttpClient
+                {
+                    Timeout = System.Threading.Timeout.InfiniteTimeSpan,
+                    BaseAddress = new Uri(configServerURL.Value.TrimEnd('/') + "/dsp.saves/api")
+                };
+                Logger.LogInfo($"{NAME} loaded");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"插件加载失败: {FormatException(ex)}");
+                // 确保异常能被Unity捕获
+                throw new InvalidOperationException("Critical plugin failure", ex);
+            }
+        }
+
+        private void InitConfig()
+        {
+            configEnabled = Config.Bind("General", "Enabled", true, new ConfigDescription("启用远程存档同步功能"));
+
+            configServerURL = Config.Bind("Server", "Remote ServerURL", "",
+                new ConfigDescription("远程服务器地址（示例：http://example.com:9999）"));
+
+            configUsername = Config.Bind("User", "Username", "", new ConfigDescription("远程服务器用户名"));
+            configPassword = Config.Bind("User", "Password", "", new ConfigDescription("远程服务器密码"));
+
+            configDownloadAll = Config.Bind("Performance", "ForceDownloadAll", false,
+                 new ConfigDescription("同步策略：true 表示用云端存档强制覆盖本地（覆盖前会自动备份到 %LOCALAPPDATA%\\DSPRemoteSaves\\backup），false 表示仅当云端更新时才下载"));
+            configFileExtensions = Config.Bind("Performance", "SyncFileExtensions", ".dsv,.moddsv,.server",
+                new ConfigDescription("需要同步的文件扩展名列表（使用英文逗号分隔）"));
+            configMaxParallelUploadCount = Config.Bind("Performance", "MaxParallelUploadCount", 3,
+                new ConfigDescription("单个文件上传时的最大并行任务数", new AcceptableValueRange<int>(1, 3)));
+            configChunkSize = Config.Bind("Performance", "ChunkSize(MB)", 5,
+                new ConfigDescription("大文件分块上传时每个分块的大小（单位：MB）", new AcceptableValueRange<int>(5, 50)));
+            configMaxChunkParallelUploadCount = Config.Bind("Performance", "MaxChunkParallelUploadCount", 5,
+                new ConfigDescription("单个文件分块上传时的最大并行分块数", new AcceptableValueRange<int>(1, 10)));
+            configMaxParallelDownloadCount = Config.Bind("Performance", "MaxParallelDownloadCount", 5,
+                new ConfigDescription("从服务器下载存档时的最大并行任务数", new AcceptableValueRange<int>(1, 10)));
+            configCheckInterval = Config.Bind("Performance", "CheckInterval(s)", 5 * 60,
+                new ConfigDescription("本地存档变更检测间隔（单位：秒）。保存后由文件监视立即触发，此间隔仅作为兜底扫描", new AcceptableValueRange<int>(10, 15 * 60)));
+            configExitBackgroundUpload = Config.Bind("Performance", "ExitBackgroundUpload", true,
+                 new ConfigDescription("退出时未传完的存档转交独立进程（DSPSavesUploader.exe）后台上传，游戏立即退出；关闭则只等待 ExitSyncTimeout(s)"));
+            configExitSyncTimeout = Config.Bind("Performance", "ExitSyncTimeout(s)", 20,
+                new ConfigDescription("退出游戏前等待最后一次上传的最长时间（单位：秒）", new AcceptableValueRange<int>(3, 120)));
+
+            Config.Save();
+        }
+
+        public void Start()
+        {
+            if (!CheckConfig()) return;
+
+            Logger.LogInfo("开始首次云存档同步");
+            var downloadTask = Task.Run(DownloadSaves);
+            try
+            {
+                // 只阻塞很短时间让常见的小体量同步先完成；超时后转后台，绝不阻止游戏启动
+                if (!downloadTask.Wait(InitialDownloadWait))
+                {
+                    Logger.LogWarning($"首次下载超过 {InitialDownloadWait.TotalSeconds:0} 秒，转入后台继续");
+                }
+            }
+            catch (AggregateException ae)
+            {
+                foreach (var e in ae.InnerExceptions)
+                {
+                    Logger.LogError($"下载终止: {FormatException(e)}");
+                }
+            }
+
+            Task.Run(() => RunAfterInitialDownloadAsync(downloadTask));
+        }
+
+        private async Task RunAfterInitialDownloadAsync(Task downloadTask)
+        {
+            try
+            {
+                // 快照必须在下载结束后建立，否则会把刚下载的文件当成新存档再传一遍
+                await downloadTask.ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // 下载失败不能阻止后续上传
+                Logger.LogError($"首次下载失败，继续启动同步循环: {FormatException(ex)}");
+            }
+
+            try
+            {
+                StartSaveWatcher();
+                await RequestLoop().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"同步循环异常退出: {FormatException(ex)}");
+            }
+        }
+
+        private async Task RequestLoop()
+        {
+            _loopCts = new CancellationTokenSource();
+            var token = _loopCts.Token;
+            var savePath = GetSavePath();
+            var extensions = GetFileExtensions();
+
+            // 快照初始化失败（通常是服务器不可达）时按间隔重试，不能像旧版一样直接退出循环
+            while (!token.IsCancellationRequested)
+            {
+                if (Directory.Exists(savePath) && await UpdateFileSnapshot(savePath, extensions).ConfigureAwait(false))
+                {
+                    break;
+                }
+
+                Logger.LogWarning("初始化文件快照失败，稍后重试");
+                if (!await WaitForNextRound(token).ConfigureAwait(false)) return;
+            }
+
+            while (!token.IsCancellationRequested)
+            {
+                if (!await WaitForNextRound(token).ConfigureAwait(false)) return;
+                try
+                {
+                    await SyncChangedFiles(savePath, extensions, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // 单轮失败不应终止整个同步循环
+                    Logger.LogError($"同步失败，将在下一轮重试: {FormatException(ex)}");
+                }
+            }
+        }
+
+        private async Task<bool> WaitForNextRound(CancellationToken token)
+        {
+            var interval = TimeSpan.FromSeconds(Math.Max(10, configCheckInterval.Value));
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(token);
+            var delayTask = Task.Delay(interval, linked.Token);
+            var signalTask = _syncSignal.WaitAsync(linked.Token);
+
+            await Task.WhenAny(delayTask, signalTask).ConfigureAwait(false);
+            linked.Cancel();
+
+            try { await delayTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            try { await signalTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            return !token.IsCancellationRequested;
+        }
+
+        private async Task SyncChangedFiles(string savePath, IEnumerable<string> extensions, CancellationToken token)
+        {
+            if (token.IsCancellationRequested) return;
+            if (!await _syncLock.WaitAsync(TimeSpan.FromSeconds(5), token).ConfigureAwait(false)) return;
+            try
+            {
+                var changedFiles = GetChangedFiles(savePath, extensions);
+                if (changedFiles.Count == 0) return;
+
+                Logger.LogInfo($"检测到 {changedFiles.Count} 个存档变更，开始同步");
+                var semaphore = new SemaphoreSlim(Math.Max(1, configMaxParallelUploadCount.Value));
+                var uploadTasks = changedFiles.Select(async filePath =>
+                {
+                    await semaphore.WaitAsync(token).ConfigureAwait(false);
+                    try
+                    {
+                        token.ThrowIfCancellationRequested();
+                        // 游戏可能还在写盘，等文件大小和时间戳稳定后再传
+                        if (!await WaitForFileReady(filePath, token).ConfigureAwait(false))
+                        {
+                            Logger.LogWarning($"文件仍在写入，跳过本轮: {Path.GetFileName(filePath)}");
+                            return;
+                        }
+
+                        if (await UploadSingleFile(filePath).ConfigureAwait(false))
+                        {
+                            var fileName = Path.GetFileName(filePath);
+                            _fileLastWriteTimes[fileName] = File.GetLastWriteTimeUtc(filePath);
+                            Logger.LogInfo($"已同步存档: {fileName}");
+                        }
+                    }
+                    catch (OperationCanceledException) { }
+                    catch (Exception ex)
+                    {
+                        Logger.LogError($"文件同步失败 [{Path.GetFileName(filePath)}]: {FormatException(ex)}");
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }).ToList();
+
+                await Task.WhenAll(uploadTasks).ConfigureAwait(false);
+            }
+            finally
+            {
+                _syncLock.Release();
+            }
+        }
+
+        /// <summary>轮询文件大小与时间戳，确认存档已写完后返回 true</summary>
+        private async Task<bool> WaitForFileReady(string filePath, CancellationToken token, int checks = 10, int intervalMs = 400)
+        {
+            long lastLength = -1;
+            DateTime lastWrite = DateTime.MinValue;
+
+            for (int i = 0; i < checks; i++)
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    var info = new FileInfo(filePath);
+                    if (!info.Exists) return false;
+
+                    if (info.Length > 0 && info.Length == lastLength && info.LastWriteTimeUtc == lastWrite)
+                    {
+                        return true;
+                    }
+
+                    lastLength = info.Length;
+                    lastWrite = info.LastWriteTimeUtc;
+                }
+                catch (IOException)
+                {
+                    // 文件正被游戏独占，稍后再试
+                }
+
+                await Task.Delay(intervalMs, token).ConfigureAwait(false);
+            }
+
+            return false;
+        }
+
+        private void StartSaveWatcher()
+        {
+            try
+            {
+                var savePath = GetSavePath();
+                if (!Directory.Exists(savePath)) return;
+
+                _saveWatcher = new FileSystemWatcher(savePath)
+                {
+                    IncludeSubdirectories = false,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime
+                };
+
+                FileSystemEventHandler onChanged = (_, __) => RequestImmediateSync();
+                RenamedEventHandler onRenamed = (_, __) => RequestImmediateSync();
+
+                _saveWatcher.Created += onChanged;
+                _saveWatcher.Changed += onChanged;
+                _saveWatcher.Renamed += onRenamed;
+                _saveWatcher.Error += (_, e) => Logger.LogWarning($"存档目录监视异常: {e.GetException()?.Message}");
+                _saveWatcher.EnableRaisingEvents = true;
+                Logger.LogInfo($"已监视存档目录: {savePath}");
+            }
+            catch (Exception ex)
+            {
+                // 监视不可用时退回定时轮询
+                Logger.LogWarning($"无法启动存档目录监视，将仅使用定时轮询: {ex.Message}");
+            }
+        }
+
+        private void RequestImmediateSync()
+        {
+            if (Volatile.Read(ref _shuttingDown) == 1) return;
+            try
+            {
+                if (_syncSignal.CurrentCount == 0) _syncSignal.Release();
+            }
+            catch (SemaphoreFullException) { }
+        }
+
+        /// <summary>游戏退出前做最后一次同步（旧版只取消循环，最后几分钟的存档会丢）</summary>
+        public void OnApplicationQuit()
+        {
+            if (!CheckConfig()) return;
+            if (Interlocked.Exchange(ref _shuttingDown, 1) == 1) return;
+
+            _loopCts?.Cancel();
+            if (_saveWatcher != null) _saveWatcher.EnableRaisingEvents = false;
+
+            var lockTaken = false;
+            try
+            {
+                // 等正在进行的同步结束，避免同一文件被并发上传
+                lockTaken = _syncLock.Wait(TimeSpan.FromSeconds(3));
+
+                var savePath = GetSavePath();
+                var extensions = GetFileExtensions();
+                var changedFiles = GetChangedFiles(savePath, extensions);
+                if (changedFiles.Count == 0)
+                {
+                    Logger.LogInfo("退出前没有待同步的存档");
+                    return;
+                }
+
+                var timeout = TimeSpan.FromSeconds(Math.Max(3, configExitSyncTimeout.Value));
+                Logger.LogInfo($"退出前同步 {changedFiles.Count} 个存档（最多等待 {timeout.TotalSeconds:0} 秒）");
+
+                var succeeded = new System.Collections.Concurrent.ConcurrentBag<string>();
+                var flushTask = Task.Run(async () =>
+                {
+                    foreach (var filePath in changedFiles)
+                    {
+                        if (!await WaitForFileReady(filePath, CancellationToken.None, 3, 200).ConfigureAwait(false))
+                        {
+                            continue;
+                        }
+
+                        if (await UploadSingleFile(filePath).ConfigureAwait(false))
+                        {
+                            succeeded.Add(filePath);
+                            Logger.LogInfo($"退出前已同步: {Path.GetFileName(filePath)}");
+                        }
+                    }
+                });
+
+                try
+                {
+                    if (!flushTask.Wait(timeout))
+                    {
+                        Logger.LogWarning("退出同步超时，未完成的存档将转交后台上传进程");
+                    }
+                }
+                catch (AggregateException ae)
+                {
+                    foreach (var e in ae.InnerExceptions) Logger.LogError($"退出同步异常: {FormatException(e)}");
+                }
+
+                // 未完成的存档转交独立进程后台上传，游戏立即退出
+                var remaining = changedFiles
+                    .Where(f => !succeeded.Contains(f))
+                    .ToList();
+                if (remaining.Count > 0 && configExitBackgroundUpload.Value)
+                {
+                    HandOffToBackgroundUploader(remaining);
+                }
+                else if (remaining.Count > 0)
+                {
+                    Logger.LogWarning("后台转交未启用，未完成的存档会在下次启动时重新上传");
+                }
+            }
+            catch (AggregateException ae)
+            {
+                foreach (var e in ae.InnerExceptions) Logger.LogError($"退出同步失败: {FormatException(e)}");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"退出同步失败: {FormatException(ex)}");
+            }
+            finally
+            {
+                if (lockTaken) _syncLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// 把未完成的存档清单写入任务文件并启动独立上传进程，
+        /// 游戏退出后由该进程继续上传（进程间无父子绑定，不受游戏退出影响）。
+        /// </summary>
+        private void HandOffToBackgroundUploader(System.Collections.Generic.List<string> files)
+        {
+            try
+            {
+                var exePath = FindUploaderExe();
+                if (string.IsNullOrEmpty(exePath))
+                {
+                    Logger.LogWarning("未找到 DSPSavesUploader.exe（放在 BepInEx/plugins 下即可），未完成的存档会在下次启动时重新上传");
+                    return;
+                }
+
+                var taskDir = Path.Combine(Path.GetDirectoryName(exePath), "DSPRemoteSaves");
+                Directory.CreateDirectory(taskDir);
+                var taskPath = Path.Combine(taskDir, $"pending-upload-{DateTime.Now:yyyyMMdd-HHmmssff}.json");
+
+                var task = new BackgroundUploadTask
+                {
+                    Server = configServerURL.Value.TrimEnd('/'),
+                    UserName = configUsername.Value,
+                    Password = configPassword.Value,
+                    LogPath = Path.Combine(taskDir, "uploader.log"),
+                    Files = files,
+                };
+                File.WriteAllText(taskPath, new CustomJsonSerializer().Serialize(task));
+
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = exePath,
+                    Arguments = $"--task \"{taskPath}\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Path.GetDirectoryName(exePath),
+                };
+                System.Diagnostics.Process.Start(psi);
+                Logger.LogInfo($"已转交后台上传进程（{files.Count} 个存档继续上传），游戏即将退出");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning($"后台上传转交失败，未完成的存档会在下次启动时重新上传: {FormatException(ex)}");
+            }
+        }
+
+        /// <summary>按插件目录 → BepInEx/plugins → BepInEx 根的顺序查找上传器</summary>
+        private string FindUploaderExe()
+        {
+            string[] dirs;
+            try
+            {
+                dirs = new[]
+                {
+                    Path.GetDirectoryName(GetType().Assembly.Location),
+                    System.IO.Path.Combine(BepInEx.Paths.BepInExRootPath, "plugins"),
+                    BepInEx.Paths.BepInExRootPath,
+                };
+            }
+            catch
+            {
+                dirs = new[] { Path.GetDirectoryName(GetType().Assembly.Location) };
+            }
+
+            foreach (var dir in dirs)
+            {
+                if (string.IsNullOrEmpty(dir)) continue;
+                var candidate = Path.Combine(dir, "DSPSavesUploader.exe");
+                if (File.Exists(candidate)) return candidate;
+            }
+            return null;
+        }
+
+        /// <summary>后台转交任务清单（与上传器约定的格式）</summary>
+        public class BackgroundUploadTask
+        {
+            [JsonProperty("server")]
+            public string Server { get; set; }
+
+            [JsonProperty("userName")]
+            public string UserName { get; set; }
+
+            [JsonProperty("password")]
+            public string Password { get; set; }
+
+            [JsonProperty("logPath")]
+            public string LogPath { get; set; }
+
+            [JsonProperty("files")]
+            public System.Collections.Generic.List<string> Files { get; set; }
+        }
+
+        public void OnDestroy()
+        {
+            _loopCts?.Cancel();
+            if (_saveWatcher != null)
+            {
+                _saveWatcher.EnableRaisingEvents = false;
+                _saveWatcher.Dispose();
+                _saveWatcher = null;
+            }
+            // 不在这里 Dispose HttpClient：退出 flush 可能仍在后台进行，交给进程回收
+            Logger.LogInfo("RemoteSaves unloaded");
+        }
+
+        /// <summary>建立本地快照；本地比云端新的存档会被推上去，云端缺失的也会补传</summary>
+        private async Task<bool> UpdateFileSnapshot(string savePath, IEnumerable<string> extensions)
+        {
+            if (!Directory.Exists(savePath)) return false;
+
+            var remoteFiles = await GetRemoteFileList(false).ConfigureAwait(false);
+            if (remoteFiles == null)
+            {
+                Logger.LogWarning("获取云端文件列表失败，跳过本轮初始化");
+                return false;
+            }
+
+            var remoteIndex = new Dictionary<string, RemoteFile>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in remoteFiles)
+            {
+                if (!string.IsNullOrEmpty(file?.FileName)) remoteIndex[file.FileName] = file;
+            }
+
+            var extensionList = extensions.ToArray();
+            foreach (var filePath in Directory.GetFiles(savePath))
+            {
+                if (!ShouldProcessFile(filePath, extensionList)) continue;
+
+                var fileName = Path.GetFileName(filePath);
+                var localMtime = ToUnixMs(File.GetLastWriteTimeUtc(filePath));
+
+                if (!remoteIndex.TryGetValue(fileName, out var remote) ||
+                    (remote.LastModified > 0 && localMtime > remote.LastModified + ClockToleranceMs))
+                {
+                    if (!await UploadSingleFile(filePath).ConfigureAwait(false))
+                    {
+                        Logger.LogError($"初始上传失败: {fileName}");
+                        return false;
+                    }
+                    Logger.LogInfo($"已上传本地存档: {fileName}");
+                }
+
+                _fileLastWriteTimes[fileName] = File.GetLastWriteTimeUtc(filePath);
+            }
+
+            return true;
+        }
+
+        private List<string> GetChangedFiles(string savePath, IEnumerable<string> extensions)
+        {
+            var changedFiles = new List<string>();
+            if (!Directory.Exists(savePath)) return changedFiles;
+
+            foreach (var filePath in Directory.GetFiles(savePath))
+            {
+                try
+                {
+                    if (!ShouldProcessFile(filePath, extensions)) continue;
+
+                    var fileName = Path.GetFileName(filePath);
+                    var currentLastWrite = File.GetLastWriteTimeUtc(filePath);
+
+                    // 检测到以下情况需要同步：
+                    // 1. 新文件（字典中不存在记录）
+                    // 2. 最后修改时间发生变化
+                    if (!_fileLastWriteTimes.TryGetValue(fileName, out var lastWrite) ||
+                        currentLastWrite > lastWrite)
+                    {
+                        changedFiles.Add(filePath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning($"文件访问异常 [{filePath}]: {ex.Message}");
+                }
+            }
+            return changedFiles;
+        }
+
+        private bool CheckConfig()
+        {
+            return configEnabled.Value &&
+                   !string.IsNullOrEmpty(configServerURL.Value) &&
+                   !string.IsNullOrEmpty(configUsername.Value) &&
+                   !string.IsNullOrEmpty(configPassword.Value);
+        }
+
+        private string GetSavePath()
+        {
+            string savePath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "Dyson Sphere Program",
+                "Save"
+            );
+
+            try
+            {
+                var gamePath = Path.GetDirectoryName(Application.dataPath);
+                var pathConfig = Path.Combine(gamePath, "Configs", "path.txt");
+
+                if (File.Exists(pathConfig))
+                {
+                    var customPath = File.ReadAllText(pathConfig).Trim();
+                    savePath = Path.Combine(customPath, "Dyson Sphere Program", "Save");
+                }
+            }
+            catch { }
+            return savePath;
+        }
+
+        private IEnumerable<string> GetFileExtensions()
+        {
+            return (configFileExtensions.Value ?? "")
+                .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(e => e.Trim().ToLowerInvariant())
+                .DefaultIfEmpty(".dsv")
+                .ToArray();
+        }
+        #region 数据模型
+        public class AuthRequest
+        {
+            [JsonProperty("userName")]
+            public string UserName { get; set; }
+
+            [JsonProperty("password")]
+            public string Password { get; set; }
+
+            /// <summary>请求毫秒时间戳（新后端防重放校验）</summary>
+            [JsonProperty("timestamp")]
+            public long? Timestamp { get; set; }
+
+            /// <summary>一次性随机数（新后端防重放校验）</summary>
+            [JsonProperty("nonce")]
+            public string Nonce { get; set; }
+        }
+        public class FileListRequest : AuthRequest
+        {
+            [JsonProperty("syncFileExtensions")]
+            public List<string> SyncFileExtensions { get; set; } = new List<string>();
+
+        }
+
+        public class UploadInitRequest : AuthRequest
+        {
+            [JsonProperty("fileName")]
+            public string FileName { get; set; }
+
+            [JsonProperty("fileSize")]
+            public long FileSize { get; set; }
+
+            [JsonProperty("chunkSize")]
+            public int ChunkSize { get; set; }
+        }
+
+        public class CompleteUploadRequest : AuthRequest
+        {
+            [JsonProperty("fileId")]
+            public string FileId { get; set; }
+        }
+
+        public class FileDownloadRequest : AuthRequest
+        {
+            [JsonProperty("fileName")]
+            public string FileName { get; set; }
+
+            [JsonProperty("isChunk")]
+            public bool IsChunk { get; set; }
+        }
+
+        public class BaseResponse
+        {
+            [JsonProperty("code")]
+            public int Code { get; set; }
+
+            [JsonProperty("message")]
+            public string Message { get; set; }
+        }
+
+        public class FileListResponse : BaseResponse
+        {
+            [JsonProperty("payload")]
+            public FileListPayload Payload { get; set; }
+        }
+
+        public class FileListPayload
+        {
+            [JsonProperty("files")]
+            public List<RemoteFile> Files { get; set; } = new List<RemoteFile>();
+        }
+
+        public class RemoteFile
+        {
+            [JsonProperty("fileName")]
+            public string FileName { get; set; }
+
+            [JsonProperty("fileSize")]
+            public long FileSize { get; set; }
+
+            /// <summary>云端文件最后修改时间（Unix 毫秒），用于冲突判定</summary>
+            [JsonProperty("lastModified")]
+            public long LastModified { get; set; }
+        }
+
+        public class UploadInitResponse : BaseResponse
+        {
+            [JsonProperty("payload")]
+            public UploadInitPayload Payload { get; set; }
+        }
+
+        public class UploadInitPayload
+        {
+            [JsonProperty("data")]
+            public UploadInitData Data { get; set; }
+        }
+
+        public class UploadInitData
+        {
+            [JsonProperty("fileId")]
+            public string FileId { get; set; }
+
+            [JsonProperty("chunkSize")]
+            public int ChunkSize { get; set; }
+
+            [JsonProperty("totalChunks")]
+            public int TotalChunks { get; set; }
+
+            /// <summary>分片上传凭据，只在 init 返回一次</summary>
+            [JsonProperty("uploadToken")]
+            public string UploadToken { get; set; }
+        }
+
+        public class PublicKeyInfo
+        {
+            public string KeyId { get; set; }
+            public string PublicKey { get; set; }
+        }
+
+        public class PublicKeyResponse : BaseResponse
+        {
+            [JsonProperty("payload")]
+            public PublicKeyPayload Payload { get; set; }
+        }
+
+        public class PublicKeyPayload
+        {
+            [JsonProperty("keyId")]
+            public string KeyId { get; set; }
+
+            [JsonProperty("publicKey")]
+            public string PublicKey { get; set; }
+
+            [JsonProperty("sm2Mode")]
+            public string Sm2Mode { get; set; }
+
+            [JsonProperty("sm4Mode")]
+            public string Sm4Mode { get; set; }
+
+            [JsonProperty("serverTime")]
+            public long ServerTime { get; set; }
+        }
+
+        public class UploadCompleteResponse : BaseResponse
+        {
+            [JsonProperty("payload")]
+            public UploadCompletePayload Payload { get; set; }
+        }
+
+        public class UploadCompletePayload
+        {
+            [JsonProperty("nots")]
+            public List<int> Nots { get; set; }
+
+            [JsonProperty("error")]
+            public ErrorInfo Error { get; set; }
+        }
+
+        public class ErrorInfo
+        {
+            [JsonProperty("name")]
+            public string Name { get; set; }
+
+            [JsonProperty("message")]
+            public string Message { get; set; }
+        }
+        #endregion
+        #region 核心逻辑
+        private async Task DownloadSaves()
+        {
+            try
+            {
+                // 获取远程文件列表
+                var remoteFiles = await GetRemoteFileList(false);
+                if (remoteFiles == null)
+                {
+                    Logger.LogWarning("无法获取云端存档列表，本次跳过下载");
+                    return;
+                }
+
+                // 获取本地文件索引（文件名不区分大小写）
+                var localFiles = GetLocalFileIndex();
+
+                if (remoteFiles.Count == 0)
+                {
+                    Logger.LogInfo("云端没有任何存档，检查本地是否有需要补传的存档");
+                    await UploadMissingOnServer(remoteFiles, localFiles).ConfigureAwait(false);
+                    return;
+                }
+
+                // 只有本地缺失，或云端确实比本地新时才下载
+                var filesToDownload = remoteFiles.Where(remoteFile =>
+                    ShouldDownloadFile(remoteFile, localFiles)
+                ).ToList();
+
+                if (filesToDownload.Count > 0)
+                {
+                    Logger.LogInfo($"开始下载 {filesToDownload.Count} 个存档文件...");
+
+                    // 控制最大并发数
+                    var semaphore = new SemaphoreSlim(Math.Max(1, configMaxParallelDownloadCount.Value));
+                    var downloadTasks = filesToDownload.Select(async file =>
+                    {
+                        await semaphore.WaitAsync();
+                        try
+                        {
+                            if (await DownloadSingleFile(file).ConfigureAwait(false))
+                            {
+                                Logger.LogInfo($"已下载存档: {file.FileName}");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogError($"下载文件 {file.FileName} 时出错：{FormatException(ex)}");
+                        }
+                        finally { semaphore.Release(); }
+                    }).ToList();
+
+                    // 等待所有下载任务完成
+                    await Task.WhenAll(downloadTasks);
+                    Logger.LogInfo("所有文件下载完成");
+                }
+                else
+                {
+                    Logger.LogInfo("本地存档均为最新，无需下载");
+                }
+
+                // 启动同步的第二阶段：云端没有、本地有的存档主动补传
+                await UploadMissingOnServer(remoteFiles, localFiles).ConfigureAwait(false);
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"存档下载失败: {FormatException(e)}");
+            }
+        }
+
+        /// <summary>
+        /// 启动同步的补传阶段：扫描本地文件，把云端没有的存档依次上传。
+        /// 上传失败仅记日志，运行期循环与下次启动会继续兜底。
+        /// </summary>
+        private async Task UploadMissingOnServer(
+            List<RemoteFile> remoteFiles,
+            Dictionary<string, FileInfo> localFiles)
+        {
+            var remoteNames = new HashSet<string>(
+                (remoteFiles ?? new List<RemoteFile>()).Select(f => f.FileName.ToLowerInvariant()));
+
+            var missing = localFiles.Values
+                .Where(info => !remoteNames.Contains(info.Name.ToLowerInvariant()))
+                .OrderBy(info => info.LastWriteTimeUtc)
+                .ToList();
+
+            if (missing.Count == 0)
+            {
+                Logger.LogInfo("云端与本地存档一致，无需补传");
+                return;
+            }
+
+            Logger.LogInfo($"云端缺失 {missing.Count} 个本地存档，开始补传...");
+
+            var semaphore = new SemaphoreSlim(Math.Max(1, configMaxParallelUploadCount.Value));
+            var tasks = missing.Select(async info =>
+            {
+                await semaphore.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    // 游戏启动初期文件可能仍在写入，确认稳定后再传
+                    if (!await WaitForFileReady(info.FullName, CancellationToken.None).ConfigureAwait(false))
+                    {
+                        Logger.LogWarning($"文件仍在写入，跳过补传: {info.Name}");
+                        return;
+                    }
+
+                    if (await UploadSingleFile(info.FullName).ConfigureAwait(false))
+                    {
+                        // 记入快照，避免运行期循环把同一文件再传一遍
+                        _fileLastWriteTimes[info.Name] = File.GetLastWriteTimeUtc(info.FullName);
+                        Logger.LogInfo($"云端缺失，已补传存档: {info.Name}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"补传存档失败 [{info.Name}]: {FormatException(ex)}");
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            }).ToList();
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+            Logger.LogInfo("补传阶段完成");
+        }
+
+        /// <summary>
+        /// 生成本地文件索引（文件名小写格式）
+        /// </summary>
+        private Dictionary<string, FileInfo> GetLocalFileIndex()
+        {
+            var savePath = GetSavePath();
+            var index = new Dictionary<string, FileInfo>();
+
+            if (!Directory.Exists(savePath)) return index;
+
+            var extensions = GetFileExtensions();
+            foreach (var filePath in Directory.GetFiles(savePath))
+            {
+                try
+                {
+                    if (!ShouldProcessFile(filePath, extensions)) continue;
+
+                    var fileInfo = new FileInfo(filePath);
+                    var lowerKey = fileInfo.Name.ToLowerInvariant();
+
+                    // 保留最新版本的文件信息
+                    if (!index.ContainsKey(lowerKey) ||
+                        fileInfo.LastWriteTimeUtc > index[lowerKey].LastWriteTimeUtc)
+                    {
+                        index[lowerKey] = fileInfo;
+                    }
+                }
+                catch (Exception e)
+                {
+                    Logger.LogWarning($"无法读取本地文件 {filePath}: {e.Message}");
+                }
+            }
+            return index;
+        }
+
+        /// <summary>
+        /// 判断是否需要下载：本地缺失，或云端时间戳比本地新（带时钟容差）
+        /// </summary>
+        private bool ShouldDownloadFile(RemoteFile remoteFile, Dictionary<string, FileInfo> localIndex)
+        {
+            if (configDownloadAll.Value) return true;
+
+            var lowerName = remoteFile.FileName.ToLowerInvariant();
+            if (!localIndex.TryGetValue(lowerName, out var localFile)) return true;
+
+            var localMtime = ToUnixMs(localFile.LastWriteTimeUtc);
+            // 旧版服务端不返回 lastModified（值为 0）时退回“本地存在即跳过”，避免误覆盖
+            return remoteFile.LastModified > 0 && remoteFile.LastModified > localMtime + ClockToleranceMs;
+        }
+
+        private async Task<bool> DownloadSingleFile(RemoteFile remoteFile)
+        {
+            var fileName = remoteFile.FileName;
+            var savePath = GetSavePath();
+            var destPath = Path.Combine(savePath, Path.GetFileName(fileName));
+            var tempPath = destPath + ".remote.tmp";
+
+            try
+            {
+                var payload = new FileDownloadRequest
+                {
+                    UserName = configUsername.Value,
+                    Password = configPassword.Value,
+                    FileName = fileName,
+                    IsChunk = false
+                };
+                Logger.LogInfo($"下载存档 {payload.UserName}/{payload.FileName}...");
+
+                // 用 ResponseHeadersRead 流式落盘，避免把整个存档先读进内存
+                using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+                using var response = await PostSealedStreamAsync(payload, "/download/download", cts.Token)
+                    .ConfigureAwait(false);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    Logger.LogError($"下载失败 HTTP {(int)response.StatusCode}: {body}");
+                    return false;
+                }
+
+                Directory.CreateDirectory(savePath);
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+
+                using (var fileStream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+                using (var source = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                {
+                    await source.CopyToAsync(fileStream, 81920, cts.Token).ConfigureAwait(false);
+                }
+
+                var downloadedLength = new FileInfo(tempPath).Length;
+                if (remoteFile.FileSize > 0 && downloadedLength != remoteFile.FileSize)
+                {
+                    File.Delete(tempPath);
+                    Logger.LogError($"下载大小不一致 ({downloadedLength}/{remoteFile.FileSize})，已丢弃: {fileName}");
+                    return false;
+                }
+
+                // 覆盖前先备份，再用替换保证原子性，避免写坏现有存档
+                if (File.Exists(destPath))
+                {
+                    BackupLocalFile(destPath);
+                    File.Replace(tempPath, destPath, null);
+                }
+                else
+                {
+                    File.Move(tempPath, destPath);
+                }
+
+                // 把本地时间对齐到云端时间，避免两台机器时钟不一致导致反复下载
+                if (remoteFile.LastModified > 0)
+                {
+                    File.SetLastWriteTimeUtc(destPath, DateTimeOffset.FromUnixTimeMilliseconds(remoteFile.LastModified).UtcDateTime);
+                }
+
+                _fileLastWriteTimes[Path.GetFileName(destPath)] = File.GetLastWriteTimeUtc(destPath);
+                Logger.LogInfo($"下载完成 {payload.UserName}/{payload.FileName}");
+                return true;
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"文件下载失败 ({fileName}): {FormatException(e)}");
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                return false;
+            }
+        }
+
+        private void BackupLocalFile(string filePath)
+        {
+            try
+            {
+                var backupRoot = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "DSPRemoteSaves",
+                    "backup",
+                    DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+                Directory.CreateDirectory(backupRoot);
+                var target = Path.Combine(backupRoot, Path.GetFileName(filePath));
+                File.Copy(filePath, target, true);
+                Logger.LogInfo($"已备份本地存档: {target}");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning($"备份本地存档失败: {ex.Message}");
+            }
+        }
+
+
+        private async Task<List<RemoteFile>> GetRemoteFileList(bool all = false)
+        {
+            try
+            {
+                var payload = all
+                    ? new FileListRequest
+                    {
+                        UserName = configUsername.Value,
+                        Password = configPassword.Value,
+                    }
+                    : new FileListRequest
+                    {
+                        UserName = configUsername.Value,
+                        Password = configPassword.Value,
+                        SyncFileExtensions = GetFileExtensions().ToList()
+                    };
+
+                using var response = await PostSealed("/download/file-list", payload).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
+                {
+                    await HandleErrorResponse(response).ConfigureAwait(false);
+                    return null;
+                }
+
+                var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                var result = new CustomJsonSerializer().Deserialize<FileListResponse>(responseString);
+
+                switch (result?.Code)
+                {
+                    case 0:
+                        return result.Payload?.Files ?? new List<RemoteFile>();
+
+                    default:
+                        await HandleErrorResponse(response).ConfigureAwait(false);
+                        return null;
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"获取文件列表失败: {FormatException(e)}");
+                return null;
+            }
+        }
+
+        private async Task<bool> UploadSingleFile(string filePath)
+        {
+            try
+            {
+                var fileName = Path.GetFileName(filePath);
+                var fileInfo = new FileInfo(filePath);
+
+                // 初始化上传
+                var (fileId, chunkSize, uploadToken) = await InitUpload(fileName, fileInfo.Length).ConfigureAwait(false);
+                if (string.IsNullOrEmpty(fileId)) return false;
+
+                // 上传分片
+                if (!await UploadChunks(filePath, fileId, chunkSize, uploadToken)) return false;
+
+                // 完成上传
+                return await CompleteUpload(fileId).ConfigureAwait(false);
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"文件上传失败 ({Path.GetFileName(filePath)}): {FormatException(e)}");
+                return false;
+            }
+        }
+        private async Task<(string FileId, int ChunkSize, string UploadToken)> InitUpload(string fileName, long fileSize)
+        {
+            try
+            {
+                var initPayload = new UploadInitRequest
+                {
+                    UserName = configUsername.Value,
+                    Password = configPassword.Value,
+                    FileName = fileName,
+                    FileSize = fileSize,
+                    ChunkSize = configChunkSize.Value * 1024 * 1024
+                };
+
+                using var response = await PostSealed("/upload/init", initPayload).ConfigureAwait(false);
+                var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                var result = new CustomJsonSerializer().Deserialize<UploadInitResponse>(responseString);
+
+                if (result?.Code == 0 && result.Payload?.Data != null)
+                {
+                    return (result.Payload.Data.FileId, result.Payload.Data.ChunkSize, result.Payload.Data.UploadToken);
+                }
+
+                await HandleErrorResponse(response).ConfigureAwait(false);
+                return (null, 0, null);
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"上传初始化失败: {FormatException(e)}");
+                return (null, 0, null);
+            }
+        }
+        private async Task<bool> UploadChunks(string filePath, string fileId, int chunkSize, string uploadToken)
+        {
+            try
+            {
+                var fileInfo = new FileInfo(filePath);
+                long fileLength = fileInfo.Length;
+                if (chunkSize <= 0)
+                {
+                    Logger.LogError("服务端返回的分片大小无效");
+                    return false;
+                }
+
+                int totalChunks = (int)Math.Ceiling(fileLength / (double)chunkSize);
+
+                // 生成分片元数据列表
+                var chunkMetadata = Enumerable.Range(0, totalChunks)
+                    .Select(i => new ChunkMeta
+                    {
+                        Index = i,
+                        StartPos = i * (long)chunkSize,
+                        ChunkLength = (int)Math.Min(chunkSize, fileLength - i * (long)chunkSize)
+                    })
+                    .ToList();
+
+                // 并行处理配置
+                var semaphore = new SemaphoreSlim(Math.Max(1, configMaxChunkParallelUploadCount.Value));
+                var failedChunks = new ConcurrentBag<int>();
+                using var cts = new CancellationTokenSource();
+
+                // 并行上传任务
+                var uploadTasks = chunkMetadata.Select(async meta =>
+                {
+                    try
+                    {
+                        await semaphore.WaitAsync(cts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+
+                    try
+                    {
+                        if (cts.IsCancellationRequested)
+                            return;
+
+                        // 独立文件流读取避免并发问题
+                        var buffer = new byte[meta.ChunkLength];
+                        using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.Asynchronous))
+                        {
+                            fs.Seek(meta.StartPos, SeekOrigin.Begin);
+                            await ReadExactlyAsync(fs, buffer, meta.ChunkLength, cts.Token).ConfigureAwait(false);
+                        }
+
+                        using var content = new ByteArrayContent(buffer);
+                        using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+                        // 按分片大小放宽超时：保底 30 秒，再按 32KB/s 估算传输时间
+                        requestCts.CancelAfter(TimeSpan.FromSeconds(30 + meta.ChunkLength / 32768.0));
+
+                        using var chunkRequest = new HttpRequestMessage(
+                            HttpMethod.Post,
+                            httpClient.BaseAddress + $"/upload/chunk?fileId={fileId}&chunkIndex={meta.Index}")
+                        {
+                            Content = content
+                        };
+                        // chunk 只认 init 签发的一次性 token，不再携带密码
+                        chunkRequest.Headers.TryAddWithoutValidation("uploadToken", uploadToken);
+                        using var response = await httpClient
+                            .SendAsync(chunkRequest, requestCts.Token)
+                            .ConfigureAwait(false);
+
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            await HandleErrorResponse(response).ConfigureAwait(false);
+                            failedChunks.Add(meta.Index);
+                            cts.Cancel();
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // 其他分片失败会取消整个文件；若是本分片超时则单独记录
+                        if (!cts.IsCancellationRequested)
+                        {
+                            Logger.LogError($"分片{meta.Index}上传超时");
+                            failedChunks.Add(meta.Index);
+                            cts.Cancel();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogError($"分片{meta.Index}上传失败: {ex.Message}");
+                        failedChunks.Add(meta.Index);
+                        cts.Cancel();
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                });
+
+                try
+                {
+                    await Task.WhenAll(uploadTasks).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // 具体错误已在各任务中处理
+                }
+
+                if (!failedChunks.IsEmpty)
+                {
+                    Logger.LogError($"以下分片上传失败: {string.Join(", ", failedChunks)}");
+                    return false;
+                }
+
+                Logger.LogInfo($"成功上传 {totalChunks} 个分片");
+                return true;
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"分片上传过程异常: {FormatException(e)}");
+                return false;
+            }
+        }
+
+        /// <summary>FileStream.ReadAsync 可能只返回部分数据，必须循环读满</summary>
+        private static async Task ReadExactlyAsync(Stream stream, byte[] buffer, int count, CancellationToken token)
+        {
+            int offset = 0;
+            while (offset < count)
+            {
+                int read = await stream.ReadAsync(buffer, offset, count - offset, token).ConfigureAwait(false);
+                if (read <= 0)
+                {
+                    throw new EndOfStreamException($"文件读取提前结束 ({offset}/{count} bytes)");
+                }
+                offset += read;
+            }
+        }
+
+        private class ChunkMeta
+        {
+            public int Index { get; set; }
+            public long StartPos { get; set; }
+            public int ChunkLength { get; set; }
+        }
+        private async Task<bool> CompleteUpload(string fileId)
+        {
+            try
+            {
+                var payload = new CompleteUploadRequest
+                {
+                    FileId = fileId,
+                    UserName = configUsername.Value,
+                    Password = configPassword.Value
+                };
+                using var response = await PostSealed("/upload/complete", payload, TimeSpan.FromMinutes(5)).ConfigureAwait(false);
+                var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                var result = new CustomJsonSerializer().Deserialize<UploadCompleteResponse>(responseString);
+                switch (result?.Code)
+                {
+                    case 0 when response.IsSuccessStatusCode:
+                        return true;
+                    case 1 when result.Payload?.Nots != null:
+                        Logger.LogError($"缺失分片: {string.Join(", ", result.Payload.Nots)}");
+                        return false;
+                    default:
+                        await HandleErrorResponse(response).ConfigureAwait(false);
+                        return false;
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"上传完成失败: {FormatException(e)}");
+                return false;
+            }
+        }
+        #endregion
+
+        #region 工具方法
+        private async Task HandleErrorResponse(HttpResponseMessage response)
+        {
+            try
+            {
+                var errorMessage = new StringBuilder()
+                    .AppendLine($"HTTP错误: {response.StatusCode} ({(int)response.StatusCode})");
+
+                var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                try
+                {
+                    var errorResponse = new CustomJsonSerializer().Deserialize<UploadCompleteResponse>(responseString);
+                    errorMessage.AppendLine($"错误码: {errorResponse?.Code}")
+                               .AppendLine($"错误信息: {errorResponse?.Message}");
+
+                    if (errorResponse?.Payload?.Nots?.Count > 0)
+                        errorMessage.AppendLine($"缺失分片索引: {string.Join(", ", errorResponse.Payload.Nots)}");
+
+                    if (errorResponse?.Payload?.Error != null)
+                        errorMessage.AppendLine($"服务端异常: {errorResponse.Payload.Error.Message}");
+                }
+                catch (Exception jsonEx)
+                {
+                    errorMessage.AppendLine($"原始响应内容: {responseString}")
+                               .AppendLine($"JSON解析失败: {jsonEx.Message}");
+                }
+
+                Logger.LogError(errorMessage.ToString());
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"错误处理过程中发生异常: {FormatException(ex)}");
+            }
+        }
+
+        private async Task<HttpResponseMessage> PostJson<T>(
+            string endpoint,
+            T payload,
+            TimeSpan? timeout = null,
+            Dictionary<string, string> extraHeaders = null)
+        {
+            var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(30);
+            try
+            {
+                var json = new CustomJsonSerializer().Serialize(payload);
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+                using var cts = new CancellationTokenSource(effectiveTimeout);
+                using var request = new HttpRequestMessage(
+                    HttpMethod.Post,
+                    httpClient.BaseAddress + endpoint)
+                {
+                    Content = content
+                };
+                if (extraHeaders != null)
+                {
+                    foreach (var header in extraHeaders)
+                    {
+                        request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                    }
+                }
+
+                // 不打印请求体，避免把用户名密码写进日志
+                Logger.LogDebug($"POST {endpoint} ({json.Length} bytes)");
+                return await httpClient.SendAsync(request, cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                Logger.LogError($"请求超时: {endpoint}");
+                throw new TimeoutException($"请求超时: {endpoint}");
+            }
+            catch (HttpRequestException e)
+            {
+                Logger.LogError($"网络请求失败: {e.Message}");
+                throw new Exception($"网络请求失败: {e.Message}", e);
+            }
+        }
+        /// <summary>拉取（或刷新）服务端 SM2 公钥。</summary>
+        private async Task<bool> EnsurePublicKeyAsync(bool force = false)
+        {
+            if (!force && _publicKey != null &&
+                (DateTime.UtcNow - _publicKeyFetchedUtc).TotalHours < 12)
+            {
+                return true;
+            }
+
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                using var response = await httpClient
+                    .GetAsync(httpClient.BaseAddress + "/crypto/public-key", cts.Token)
+                    .ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
+                {
+                    Logger.LogError($"获取公钥失败: HTTP {(int)response.StatusCode}");
+                    return false;
+                }
+
+                var text = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                var parsed = new CustomJsonSerializer().Deserialize<PublicKeyResponse>(text);
+                if (parsed?.Code != 0 || parsed.Payload == null ||
+                    string.IsNullOrEmpty(parsed.Payload.PublicKey) ||
+                    string.IsNullOrEmpty(parsed.Payload.KeyId))
+                {
+                    Logger.LogError("公钥响应格式非法");
+                    return false;
+                }
+
+                _publicKey = new PublicKeyInfo
+                {
+                    KeyId = parsed.Payload.KeyId,
+                    PublicKey = parsed.Payload.PublicKey
+                };
+                _publicKeyFetchedUtc = DateTime.UtcNow;
+                Logger.LogInfo($"已获取国密公钥 keyId={_publicKey.KeyId}");
+                return true;
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"获取公钥异常: {FormatException(e)}");
+                return false;
+            }
+        }
+
+        /// <summary>把密码加密后写入 payload，并返回需要附加的请求头。</summary>
+        private async Task<Dictionary<string, string>> SealAsync(AuthRequest payload, bool forceRefresh = false)
+        {
+            if (!await EnsurePublicKeyAsync(forceRefresh).ConfigureAwait(false))
+            {
+                throw new InvalidOperationException("无法获取服务端国密公钥");
+            }
+
+            SmCrypto.SealPassword(
+                _publicKey.PublicKey,
+                configPassword.Value,
+                out string smkey,
+                out string cipher);
+
+            payload.UserName = configUsername.Value;
+            payload.Password = cipher;
+            // 新后端的防重放字段：毫秒时间戳 + 一次性随机数
+            payload.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            payload.Nonce = Guid.NewGuid().ToString("N");
+            return new Dictionary<string, string>
+            {
+                { "smkey", smkey },
+                { "smkeyid", _publicKey.KeyId }
+            };
+        }
+
+        /// <summary>发送带国密信封的 JSON；遇到 2005 自动刷新公钥并重试一次。</summary>
+        private async Task<HttpResponseMessage> PostSealed<T>(
+            string endpoint,
+            T payload,
+            TimeSpan? timeout = null) where T : AuthRequest
+        {
+            HttpResponseMessage last = null;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                var headers = await SealAsync(payload, attempt > 0).ConfigureAwait(false);
+                last = await PostJson(endpoint, payload, timeout, headers).ConfigureAwait(false);
+                if (last.IsSuccessStatusCode)
+                {
+                    return last;
+                }
+
+                var body = await last.Content.ReadAsStringAsync().ConfigureAwait(false);
+                if (body.Contains("\"code\":2005") || body.Contains("\"code\": 2005"))
+                {
+                    last.Dispose();
+                    continue;
+                }
+                return last;
+            }
+            return last;
+        }
+
+        /// <summary>流式下载：同样走国密信封，并支持 2005 重试。</summary>
+        private async Task<HttpResponseMessage> PostSealedStreamAsync(
+            AuthRequest payload,
+            string endpoint,
+            CancellationToken token)
+        {
+            HttpResponseMessage last = null;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                var headers = await SealAsync(payload, attempt > 0).ConfigureAwait(false);
+                var json = new CustomJsonSerializer().Serialize(payload);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+                var request = new HttpRequestMessage(
+                    HttpMethod.Post,
+                    httpClient.BaseAddress + endpoint)
+                {
+                    Content = content
+                };
+                foreach (var header in headers)
+                {
+                    request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                }
+
+                last = await httpClient
+                    .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token)
+                    .ConfigureAwait(false);
+                if (last.IsSuccessStatusCode)
+                {
+                    return last;
+                }
+
+                var body = await last.Content.ReadAsStringAsync().ConfigureAwait(false);
+                if (body.Contains("\"code\":2005") || body.Contains("\"code\": 2005"))
+                {
+                    last.Dispose();
+                    continue;
+                }
+                return last;
+            }
+            return last;
+        }
+
+        private string FormatException(Exception e)
+        {
+            return $"{e.GetType().Name}: {e.Message}\nStackTrace: {e.StackTrace}";
+        }
+
+        private static long ToUnixMs(DateTime utcTime)
+        {
+            return new DateTimeOffset(DateTime.SpecifyKind(utcTime, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+        }
+
+        private bool ShouldProcessFile(string fileName, IEnumerable<string> extensions)
+        {
+            var ext = Path.GetExtension(fileName);
+            return extensions.Any(e => string.Equals(e, ext, StringComparison.OrdinalIgnoreCase));
+        }
+
+        // 自定义特性类
+        [AttributeUsage(AttributeTargets.Property)]
+        public class JsonPropertyAttribute : Attribute
+        {
+            public string Name { get; set; }
+            public bool IgnoreNull { get; set; }  // 是否忽略空值
+
+            public JsonPropertyAttribute(string name)
+            {
+                Name = name;
+                IgnoreNull = true;
+            }
+        }
+
+        public class CustomJsonSerializer
+        {
+            // 序列化入口
+            public string Serialize(object obj)
+            {
+                var sb = new StringBuilder();
+                SerializeValue(obj, sb, 0);
+                return sb.ToString();
+            }
+
+            // 反序列化入口
+            public T Deserialize<T>(string json) where T : new()
+            {
+                int index = 0;
+                return (T)ParseValue(json, ref index, typeof(T));
+            }
+
+            #region 序列化逻辑
+            private void SerializeValue(object value, StringBuilder sb, int depth)
+            {
+                if (value == null)
+                {
+                    sb.Append("null");
+                    return;
+                }
+
+                Type type = value.GetType();
+
+                // 处理字符串
+                if (type == typeof(string))
+                {
+                    sb.Append($"\"{EscapeString((string)value)}\"");
+                }
+                // 布尔值必须小写，且不能用 ToString().ToLower() 统一处理
+                else if (type == typeof(bool))
+                {
+                    sb.Append((bool)value ? "true" : "false");
+                }
+                // 枚举按字符串输出，避免产生非法 JSON
+                else if (type.IsEnum)
+                {
+                    sb.Append($"\"{EscapeString(value.ToString())}\"");
+                }
+                // 数值类型使用不变文化，避免小数点被本地化成逗号
+                else if (type.IsPrimitive || type == typeof(decimal))
+                {
+                    sb.Append(Convert.ToString(value, CultureInfo.InvariantCulture));
+                }
+                // 处理字典
+                else if (IsDictionary(type))
+                {
+                    SerializeDictionary((IDictionary)value, sb, depth);
+                }
+                // 处理集合
+                else if (IsEnumerable(type))
+                {
+                    SerializeArray((IEnumerable)value, sb, depth);
+                }
+                // 处理普通对象
+                else
+                {
+                    SerializeObject(value, sb, depth);
+                }
+            }
+
+            #region 修改后的序列化对象方法（支持JsonProperty）
+            private void SerializeObject(object obj, StringBuilder sb, int depth)
+            {
+                sb.Append("{");
+                var properties = obj.GetType().GetProperties();
+                bool first = true;
+
+                foreach (var prop in properties)
+                {
+                    if (!prop.CanRead) continue;
+
+                    // 获取JsonProperty特性
+                    var jsonProp = prop.GetCustomAttribute<JsonPropertyAttribute>();
+                    var propName = jsonProp?.Name ?? prop.Name;
+
+                    var value = prop.GetValue(obj);
+                    if (first) first = false;
+                    else sb.Append(",");
+
+                    sb.Append($"\"{propName}\":");
+                    SerializeValue(value, sb, depth + 1);
+                }
+                sb.Append("}");
+            }
+            #endregion
+
+            // 序列化数组/集合
+            private void SerializeArray(IEnumerable collection, StringBuilder sb, int depth)
+            {
+                sb.Append("[");
+                bool first = true;
+
+                foreach (var item in collection)
+                {
+                    if (first) first = false;
+                    else sb.Append(",");
+
+                    SerializeValue(item, sb, depth + 1);
+                }
+                sb.Append("]");
+            }
+
+            // 序列化字典
+            private void SerializeDictionary(IDictionary dict, StringBuilder sb, int depth)
+            {
+                sb.Append("{");
+                bool first = true;
+                var enumerator = dict.GetEnumerator();
+
+                while (enumerator.MoveNext())
+                {
+                    if (first) first = false;
+                    else sb.Append(",");
+
+                    var key = enumerator.Key;
+                    var value = enumerator.Value;
+
+                    sb.Append($"\"{key}\":");
+                    SerializeValue(value, sb, depth + 1);
+                }
+                sb.Append("}");
+            }
+            #endregion
+
+            #region 反序列化逻辑
+            private object ParseValue(string json, ref int index, Type targetType)
+            {
+                SkipWhitespace(json, ref index);
+
+                if (index >= json.Length) return null;
+
+                char current = json[index];
+
+                // 处理对象
+                if (current == '{')
+                {
+                    return ParseObject(json, ref index, targetType);
+                }
+                // 处理数组
+                else if (current == '[')
+                {
+                    return ParseArray(json, ref index, targetType);
+                }
+                // 处理字符串
+                else if (current == '"')
+                {
+                    return ParseString(json, ref index);
+                }
+                // 处理null
+                else if (index + 4 < json.Length && json.Substring(index, 4) == "null")
+                {
+                    index += 4;
+                    return null;
+                }
+                // 处理数值/布尔值
+                else
+                {
+                    return ParsePrimitive(json, ref index, targetType);
+                }
+            }
+
+            #region 修改后的对象解析方法（支持JsonProperty）
+            private object ParseObject(string json, ref int index, Type targetType)
+            {
+                index++; // 跳过 '{'
+                var obj = Activator.CreateInstance(targetType);
+                var propMap = CreatePropertyMap(targetType);
+
+                while (index < json.Length)
+                {
+                    SkipWhitespace(json, ref index);
+                    if (index >= json.Length) break;
+                    if (json[index] == '}') break;
+
+                    // 解析JSON键名
+                    string jsonKey = ParseString(json, ref index);
+                    SkipWhitespace(json, ref index);
+                    if (index >= json.Length) break;
+                    if (json[index] != ':') throw new FormatException("Expected colon");
+                    index++; // 跳过 ':'
+
+                    // 查找匹配的属性；未知字段必须跳过，否则服务端新增字段会导致整个解析失败
+                    if (propMap.TryGetValue(jsonKey, out PropertyInfo prop) && prop.CanWrite)
+                    {
+                        object value = ParseValue(json, ref index, prop.PropertyType);
+                        prop.SetValue(obj, value);
+                    }
+                    else
+                    {
+                        SkipValue(json, ref index);
+                    }
+
+                    SkipWhitespace(json, ref index);
+                    if (index < json.Length && json[index] == ',') index++;
+                }
+
+                index++; // 跳过 '}'
+                return obj;
+            }
+            // 创建属性名称映射表
+            private Dictionary<string, PropertyInfo> CreatePropertyMap(Type type)
+            {
+                var map = new Dictionary<string, PropertyInfo>(StringComparer.OrdinalIgnoreCase);
+                foreach (var prop in type.GetProperties())
+                {
+                    var jsonProp = prop.GetCustomAttribute<JsonPropertyAttribute>();
+                    var key = jsonProp?.Name ?? prop.Name;
+                    map[key] = prop;
+                }
+                return map;
+            }
+            #endregion
+
+            // 解析数组
+            private object ParseArray(string json, ref int index, Type targetType)
+            {
+                index++; // 跳过 '['
+                var list = new List<object>();
+                Type elementType = GetCollectionElementType(targetType);
+
+                while (index < json.Length)
+                {
+                    SkipWhitespace(json, ref index);
+                    if (index >= json.Length) break;
+                    if (json[index] == ']') break;
+
+                    // 解析元素
+                    object element = ParseValue(json, ref index, elementType);
+                    list.Add(element);
+
+                    // 处理逗号
+                    SkipWhitespace(json, ref index);
+                    if (index < json.Length && json[index] == ',') index++;
+                }
+
+                index++; // 跳过 ']'
+                return ConvertListToTargetType(list, targetType, elementType);
+            }
+
+            /// <summary>跳过一个未知字段的值（字符串/对象/数组/字面量）</summary>
+            private void SkipValue(string json, ref int index)
+            {
+                SkipWhitespace(json, ref index);
+                if (index >= json.Length) return;
+
+                char current = json[index];
+                if (current == '"')
+                {
+                    ParseString(json, ref index);
+                    return;
+                }
+
+                if (current == '{' || current == '[')
+                {
+                    char close = current == '{' ? '}' : ']';
+                    int depth = 0;
+                    while (index < json.Length)
+                    {
+                        char ch = json[index];
+                        if (ch == '"')
+                        {
+                            ParseString(json, ref index);
+                            continue;
+                        }
+                        if (ch == current) depth++;
+                        else if (ch == close)
+                        {
+                            depth--;
+                            index++;
+                            if (depth == 0) return;
+                            continue;
+                        }
+                        index++;
+                    }
+                    return;
+                }
+
+                while (index < json.Length && !IsEndOfPrimitive(json[index])) index++;
+            }
+            #endregion
+
+            #region 辅助方法
+            // 类型判断
+            private bool IsEnumerable(Type type)
+            {
+                return typeof(IEnumerable).IsAssignableFrom(type) &&
+                       type != typeof(string);
+            }
+
+            private bool IsDictionary(Type type)
+            {
+                return typeof(IDictionary).IsAssignableFrom(type);
+            }
+
+            // 获取集合元素类型
+            private Type GetCollectionElementType(Type collectionType)
+            {
+                if (collectionType.IsArray)
+                    return collectionType.GetElementType();
+
+                if (collectionType.IsGenericType)
+                    return collectionType.GetGenericArguments()[0];
+
+                return typeof(object);
+            }
+
+            // 类型转换逻辑
+            private object ConvertListToTargetType(List<object> list, Type targetType, Type elementType)
+            {
+                if (targetType.IsArray)
+                {
+                    Array array = Array.CreateInstance(elementType, list.Count);
+                    for (int i = 0; i < list.Count; i++)
+                        array.SetValue(list[i], i);
+                    return array;
+                }
+
+                if (targetType.IsGenericType)
+                {
+                    Type listType = typeof(List<>).MakeGenericType(elementType);
+                    var typedList = Activator.CreateInstance(listType);
+                    MethodInfo addMethod = listType.GetMethod("Add");
+
+                    foreach (var item in list)
+                        addMethod.Invoke(typedList, new[] { item });
+
+                    return typedList;
+                }
+
+                return list;
+            }
+
+            // 字符串处理
+            #region 字符串处理
+            private string EscapeString(string s)
+            {
+                if (string.IsNullOrEmpty(s)) return "";
+
+                var sb = new StringBuilder(s.Length);
+                foreach (char c in s)
+                {
+                    switch (c)
+                    {
+                        case '\\': sb.Append("\\\\"); break;
+                        case '"': sb.Append("\\\""); break;
+                        case '\n': sb.Append("\\n"); break;
+                        case '\r': sb.Append("\\r"); break;
+                        case '\t': sb.Append("\\t"); break;
+                        default: sb.Append(c); break;
+                    }
+                }
+                return sb.ToString();
+            }
+
+            private string UnescapeString(string s)
+            {
+                if (string.IsNullOrEmpty(s)) return "";
+
+                var sb = new StringBuilder(s.Length);
+                for (int i = 0; i < s.Length; i++)
+                {
+                    if (s[i] == '\\' && i + 1 < s.Length)
+                    {
+                        switch (s[++i])
+                        {
+                            case '\\': sb.Append('\\'); break;
+                            case '"': sb.Append('"'); break;
+                            case 'n': sb.Append('\n'); break;
+                            case 'r': sb.Append('\r'); break;
+                            case 't': sb.Append('\t'); break;
+                            default: sb.Append('\\').Append(s[i]); break;
+                        }
+                    }
+                    else
+                    {
+                        sb.Append(s[i]);
+                    }
+                }
+                return sb.ToString();
+            }
+            #endregion
+
+            #region 解析辅助方法
+            // 跳过空白字符
+            private void SkipWhitespace(string json, ref int index)
+            {
+                while (index < json.Length && char.IsWhiteSpace(json[index]))
+                {
+                    index++;
+                }
+            }
+
+            // 解析字符串
+            private string ParseString(string json, ref int index)
+            {
+                index++; // 跳过起始引号
+                var sb = new StringBuilder();
+
+                while (index < json.Length)
+                {
+                    char c = json[index++];
+                    if (c == '"') break;
+
+                    if (c == '\\' && index < json.Length)
+                    {
+                        c = json[index++];
+                        switch (c)
+                        {
+                            case '\\': sb.Append('\\'); break;
+                            case '"': sb.Append('"'); break;
+                            case 'n': sb.Append('\n'); break;
+                            case 'r': sb.Append('\r'); break;
+                            case 't': sb.Append('\t'); break;
+                            default: sb.Append('\\').Append(c); break;
+                        }
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
+                }
+
+                return sb.ToString();
+            }
+
+            // 解析基础类型
+            private object ParsePrimitive(string json, ref int index, Type targetType)
+            {
+                int start = index;
+
+                while (index < json.Length && !IsEndOfPrimitive(json[index]))
+                {
+                    index++;
+                }
+
+                string value = json.Substring(start, index - start);
+
+                if (targetType == typeof(bool))
+                {
+                    return bool.Parse(value);
+                }
+
+                if (targetType.IsEnum)
+                {
+                    return Enum.Parse(targetType, value, true);
+                }
+
+                // 处理数值类型
+                try
+                {
+                    return Convert.ChangeType(value, targetType, CultureInfo.InvariantCulture);
+                }
+                catch
+                {
+                    throw new FormatException($"Cannot convert '{value}' to {targetType.Name}");
+                }
+            }
+
+            // 判断基础类型结束位置
+            private bool IsEndOfPrimitive(char c)
+            {
+                return c == ',' || c == '}' || c == ']' || char.IsWhiteSpace(c);
+            }
+            #endregion
+            #endregion
+
+
+        }
+        #endregion
+    }
+}

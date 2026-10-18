@@ -1,0 +1,22 @@
+[package]
+name = "acc-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DSP 云存档运维命令行"
+
+[[bin]]
+name = "acc-cli"
+path = "src/main.rs"
+
+[dependencies]
+acc-server = { path = "../acc-server" }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+mongodb = { workspace = true }

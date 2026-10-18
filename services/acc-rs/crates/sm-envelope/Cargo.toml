@@ -1,0 +1,27 @@
+[package]
+name = "sm-envelope"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "国密 SM2/SM4 密码信封：与 sm-crypto / BouncyCastle 逐字节互通"
+
+[dependencies]
+sm2 = { version = "0.14", features = ["pkcs8", "pem", "getrandom"] }
+sm4 = "0.5"
+sm3 = "0.4"
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+secrecy = { workspace = true }
+argon2 = { workspace = true }
+chacha20poly1305 = "0.10"
+zeroize = "1"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

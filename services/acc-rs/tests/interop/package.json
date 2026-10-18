@@ -1,0 +1,9 @@
+{
+  "name": "sm-interop",
+  "private": true,
+  "type": "module",
+  "version": "2.0.0",
+  "dependencies": {
+    "sm-crypto": "^0.3.13"
+  }
+}

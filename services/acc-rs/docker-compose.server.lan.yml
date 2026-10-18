@@ -1,0 +1,54 @@
+# 内网服务器部署（192.168.0.101）：基础设施在公网 47.109.110.125，
+# 本机 9999 由 frpc 映射到公网 9999（见 /opt/frp/frpc_dsp.toml + frpc_dsp.service）
+#
+# 使用：
+#   1. 把本目录放到服务器，例如 /opt/dsp-saves/app
+#   2. mkdir -p /opt/dsp-saves/{data,saves}
+#   3. docker compose -f docker-compose.server.yml up -d --build
+#   4. docker compose -f docker-compose.server.yml exec app \
+#        acc-cli --config /app/config.toml admin create --username admin --password '<强密码>'
+#
+# 说明：
+# - app 加入已有的 1panel-network，按容器名访问 1Panel-mongodb-y7az / 1Panel-redis-dlRD
+# - 只把 9999 发布到 127.0.0.1，由 1Panel 站点反向代理对外提供 HTTPS
+# - 不启动 Mongo/Redis/MinIO，避免与 1Panel 已有的实例重复
+
+name: dsp-saves
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dsp-saves:2.0.2
+    container_name: dsp-saves-app
+    restart: unless-stopped
+    env_file:
+      - .env.server
+    environment:
+      TZ: Asia/Shanghai
+    networks:
+      - panel
+    ports:
+      # 临时公网测试：放开后记得改回 "127.0.0.1:9999:9999" 并用反代
+      - "9999:9999"
+    volumes:
+      - /media/aims/data/DSPCoudSaves:/app/saves
+      - /opt/dsp-saves/data:/app/data
+      - ./config.server.toml:/app/config.toml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9999/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  panel:
+    external: true
+    name: 1panel-network

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>DSPSavesUploader</AssemblyName>
+    <RootNamespace>DSPSavesUploader</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <AssemblyTitle>DSP 云存档后台上传器</AssemblyTitle>
+    <Description>游戏退出后继续上传未完成的存档（独立进程）</Description>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\SmCrypto.cs" Link="SmCrypto.cs" />
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.IO.Compression" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,36 @@
+[server]
+bind = "127.0.0.1:9999"
+base_path = "/dsp.saves/api"
+public_url = "http://127.0.0.1:9999"
+trusted_proxy_cidrs = []
+
+[database]
+uri = "mongodb://127.0.0.1:27017"
+db = "DSPCloudSaves"
+
+[redis]
+enabled = false
+url = "redis://127.0.0.1:6379/0"
+prefix = "dsp:dev:v1:"
+
+[auth]
+cookie_secure = false
+jwt_secret_file = "./.dev/data/jwt.secret"
+server_secret_file = "./.dev/data/server.secret"
+
+[crypto]
+key_dir = "./.dev/data/keys"
+
+[storage]
+saves_dir = "./.dev/saves"
+
+[mail]
+enabled = false
+
+[backup]
+enabled = false
+work_dir = "./.dev/backup"
+
+[log]
+level = "info"
+format = "compact"

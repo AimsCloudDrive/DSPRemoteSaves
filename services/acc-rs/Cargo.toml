@@ -1,0 +1,90 @@
+[workspace]
+members = [
+    "crates/sm-envelope",
+    "crates/acc-server",
+    "crates/acc-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+authors = ["DSPRemoteSaves"]
+
+[workspace.dependencies]
+sm-envelope = { path = "crates/sm-envelope" }
+
+# Web
+axum = { version = "0.8.9", features = ["macros", "multipart"] }
+axum-extra = { version = "0.10.3", features = ["cookie"] }
+cookie = "0.18"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = [
+    "trace",
+    "limit",
+    "compression-gzip",
+    "set-header",
+    "cors",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Database / cache
+mongodb = "3.9"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# Crypto / auth
+argon2 = "0.5.3"
+secrecy = "0.10.3"
+jsonwebtoken = "9.3"
+rand = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+sm3 = "0.4"
+hmac = "0.12"
+subtle = "2.6"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Mail
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls-tls",
+    "builder",
+    "hostname",
+    "pool",
+] }
+
+# Config / logging
+figment = { version = "0.10", features = ["toml", "env"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Misc
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+percent-encoding = "2"
+rust-embed = { version = "8.7", features = ["include-exclude"] }
+mime_guess = "2"
+unicode-normalization = "0.1"
+fs4 = { version = "0.13", features = ["sync"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

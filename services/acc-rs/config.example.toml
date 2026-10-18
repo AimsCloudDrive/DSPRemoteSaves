@@ -1,0 +1,116 @@
+# DSP 云存档服务配置示例
+# 复制为 config.toml 后修改；支持 ${ENV} 占位符，未设置的变量会导致启动失败（避免静默空密码）。
+# 也可用 ACC_ 前缀环境变量覆盖，例如 ACC_SERVER__BIND=0.0.0.0:8000（双下划线分层）。
+
+[server]
+bind = "0.0.0.0:9999"
+base_path = "/dsp.saves/api"
+# 对外地址，用于 Cookie Path 与前端展示；生产必须是 https
+public_url = "https://${DOMAIN}"
+# 只有来自这些网段的 X-Forwarded-For 才可信（Caddy / Docker 内网）
+trusted_proxy_cidrs = ["127.0.0.1/32", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+request_timeout_seconds = 900
+
+[database]
+uri = "mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongo:27017/?authSource=admin"
+db = "DSPCloudSaves"
+
+[redis]
+enabled = true
+url = "redis://redis:6379/0"
+prefix = "dsp:prod:v1:"
+pool_size = 16
+connect_timeout_ms = 1000
+command_timeout_ms = 500
+
+[redis.ttl]
+replay_seconds = 600
+token_version_seconds = 30
+user_cache_seconds = 30
+file_list_seconds = 30
+stats_seconds = 60
+
+[auth]
+access_ttl_minutes = 120
+refresh_ttl_days = 7
+jwt_secret_file = "/app/data/jwt.secret"
+server_secret_file = "/app/data/server.secret"
+admin_idle_minutes = 30
+argon2_memory_kib = 19456
+argon2_iterations = 2
+argon2_parallelism = 1
+cookie_secure = true
+# 允许的前端 Origin；留空表示只允许 public_url 同源
+allowed_origins = []
+max_login_failures = 5
+login_failure_window_seconds = 600
+login_lock_seconds = 900
+
+[crypto]
+key_dir = "/app/data/keys"
+key_grace_hours = 24
+# 私钥口令从该环境变量读取（建议在 .env 设置）；留空则只依赖文件权限 0600
+passphrase_env = "SM2_KEY_PASSPHRASE"
+timestamp_tolerance_seconds = 300
+
+[storage]
+saves_dir = "/app/saves"
+max_file_size = 2147483648
+max_chunk_size = 67108864
+max_total_chunks = 20000
+min_free_bytes = 2147483648
+upload_idle_seconds = 600
+upload_max_hours = 24
+
+[quota]
+# 1GB
+default_bytes = 1073741824
+
+[email_code]
+length = 6
+ttl_seconds = 300
+resend_seconds = 60
+max_attempts = 5
+per_email_per_hour = 5
+per_email_per_day = 10
+per_ip_per_hour = 10
+per_ip_per_day = 30
+per_domain_per_hour = 100
+global_per_hour = 100
+global_per_day = 450
+queue_capacity = 100
+register_per_ip_per_day = 3
+verify_failures_per_hour = 20
+disposable_domains = []
+
+[mail]
+enabled = true
+smtp_host = "smtp.exmail.qq.com"
+smtp_port = 465
+# implicit（465）或 starttls（587）
+smtp_tls = "implicit"
+from_address = "${SMTP_FROM}"
+from_name = "DSP 云存档"
+username = "${SMTP_USER}"
+password = "${SMTP_PASSWORD}"
+daily_limit = 500
+
+[backup]
+enabled = true
+# 本地时间 HH:MM
+at = "03:00"
+retention_days = 30
+encrypt = false
+bucket = "${BACKUP_BUCKET}"
+work_dir = "/app/data/backup"
+
+[backup.minio]
+endpoint = "http://minio:9000"
+access_key = "${MINIO_ACCESS_KEY}"
+secret_key = "${MINIO_SECRET_KEY}"
+region = "us-east-1"
+use_path_style = true
+
+[log]
+level = "info"
+format = "json"

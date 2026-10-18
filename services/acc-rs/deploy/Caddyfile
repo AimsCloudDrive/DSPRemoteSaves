@@ -1,0 +1,33 @@
+# DSP 云存档：Caddy 反向代理 + 自动 HTTPS
+# 管理端接口额外限制来源网段（默认只允许内网/回环），公网请求由 Caddy 直接 403。
+
+{$DOMAIN:localhost} {
+	encode zstd gzip
+
+	# 管理端：仅内网 / VPN
+	@admin path /dsp.saves/api/admin/*
+	handle @admin {
+		@blocked not remote_ip {$ADMIN_ALLOW_CIDRS:127.0.0.1/32 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}
+		respond @blocked "Forbidden" 403
+		reverse_proxy app:9999
+	}
+
+	# 其余接口与用户门户
+	reverse_proxy app:9999
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 50MiB
+			roll_keep 10
+		}
+		format json
+	}
+}
