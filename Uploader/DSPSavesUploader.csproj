@@ -4,6 +4,7 @@
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
+    <Version>2.1.0</Version>
     <AssemblyName>DSPSavesUploader</AssemblyName>
     <RootNamespace>DSPSavesUploader</RootNamespace>
     <LangVersion>latest</LangVersion>
