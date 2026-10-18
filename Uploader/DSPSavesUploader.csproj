@@ -15,7 +15,5 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="..\SmCrypto.cs" Link="SmCrypto.cs" />
-    <Reference Include="System.Net.Http" />
-    <Reference Include="System.IO.Compression" />
   </ItemGroup>
 </Project>

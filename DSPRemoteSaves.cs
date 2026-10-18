@@ -45,7 +45,6 @@ namespace DSPRemoteSaves
         /// <summary>云端与本地时间戳比较时允许的误差（毫秒）</summary>
         private const long ClockToleranceMs = 2000;
         /// <summary>启动时最多阻塞主线程等待首次下载的时间</summary>
-        private static readonly TimeSpan InitialDownloadWait = TimeSpan.FromSeconds(10);
 
         private HttpClient httpClient;
         /// <summary>服务端 SM2 公钥；启动/首次请求时拉取，收到 2005 时强制刷新</summary>
@@ -120,24 +119,10 @@ namespace DSPRemoteSaves
         {
             if (!CheckConfig()) return;
 
-            Logger.LogInfo("开始首次云存档同步");
+            // 下载/补传全部后台执行，绝不阻塞 Unity 主线程（避免启动时游戏无响应）。
+            // 大文件补传由独立上传器进程完成（见 DownloadSaves 第二阶段）。
+            Logger.LogInfo("首次云存档同步已在后台启动（下载与补传均不阻塞游戏）");
             var downloadTask = Task.Run(DownloadSaves);
-            try
-            {
-                // 只阻塞很短时间让常见的小体量同步先完成；超时后转后台，绝不阻止游戏启动
-                if (!downloadTask.Wait(InitialDownloadWait))
-                {
-                    Logger.LogWarning($"首次下载超过 {InitialDownloadWait.TotalSeconds:0} 秒，转入后台继续");
-                }
-            }
-            catch (AggregateException ae)
-            {
-                foreach (var e in ae.InnerExceptions)
-                {
-                    Logger.LogError($"下载终止: {FormatException(e)}");
-                }
-            }
-
             Task.Run(() => RunAfterInitialDownloadAsync(downloadTask));
         }
 
@@ -454,15 +439,20 @@ namespace DSPRemoteSaves
                 };
                 File.WriteAllText(taskPath, new CustomJsonSerializer().Serialize(task));
 
-                var psi = new System.Diagnostics.ProcessStartInfo
+                // 用 WMI Win32_Process.Create 启动：进程由 WMI 服务创建，
+                // 不属于游戏进程树，也不在游戏的 Job 对象内 —— 游戏退出、
+                // Steam/r2modman 的 Job 清理都不会连带杀死上传器。
+                var wmi = new System.Management.ManagementClass("Win32_Process");
+                var inParams = wmi.GetMethodParameters("Create");
+                inParams["CommandLine"] = $"\"{exePath}\" --task \"{taskPath}\"";
+                inParams["CurrentDirectory"] = Path.GetDirectoryName(exePath);
+                var outParams = wmi.InvokeMethod("Create", inParams, null);
+                var ret = Convert.ToInt32(outParams["ReturnValue"]);
+                if (ret != 0)
                 {
-                    FileName = exePath,
-                    Arguments = $"--task \"{taskPath}\"",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = Path.GetDirectoryName(exePath),
-                };
-                System.Diagnostics.Process.Start(psi);
+                    Logger.LogWarning($"后台上传进程创建失败（WMI 返回 {ret}），未完成的存档会在下次启动时重新上传");
+                    return;
+                }
                 Logger.LogInfo($"已转交后台上传进程（{files.Count} 个存档继续上传），游戏即将退出");
             }
             catch (Exception ex)
@@ -829,7 +819,7 @@ namespace DSPRemoteSaves
                 if (remoteFiles.Count == 0)
                 {
                     Logger.LogInfo("云端没有任何存档，检查本地是否有需要补传的存档");
-                    await UploadMissingOnServer(remoteFiles, localFiles).ConfigureAwait(false);
+                    UploadMissingOnServer(remoteFiles, localFiles);
                     return;
                 }
 
@@ -870,8 +860,8 @@ namespace DSPRemoteSaves
                     Logger.LogInfo("本地存档均为最新，无需下载");
                 }
 
-                // 启动同步的第二阶段：云端没有、本地有的存档主动补传
-                await UploadMissingOnServer(remoteFiles, localFiles).ConfigureAwait(false);
+                // 启动同步的第二阶段：云端没有、本地有的存档转交后台上传进程
+                UploadMissingOnServer(remoteFiles, localFiles);
             }
             catch (Exception e)
             {
@@ -880,10 +870,10 @@ namespace DSPRemoteSaves
         }
 
         /// <summary>
-        /// 启动同步的补传阶段：扫描本地文件，把云端没有的存档依次上传。
-        /// 上传失败仅记日志，运行期循环与下次启动会继续兜底。
+        /// 启动同步的补传阶段：扫描本地文件，把云端没有的存档写入任务清单，
+        /// 并转交独立上传器进程上传。游戏进程内不做大流量传输，避免与游戏抢资源。
         /// </summary>
-        private async Task UploadMissingOnServer(
+        private void UploadMissingOnServer(
             List<RemoteFile> remoteFiles,
             Dictionary<string, FileInfo> localFiles)
         {
@@ -893,6 +883,7 @@ namespace DSPRemoteSaves
             var missing = localFiles.Values
                 .Where(info => !remoteNames.Contains(info.Name.ToLowerInvariant()))
                 .OrderBy(info => info.LastWriteTimeUtc)
+                .Select(info => info.FullName)
                 .ToList();
 
             if (missing.Count == 0)
@@ -901,40 +892,8 @@ namespace DSPRemoteSaves
                 return;
             }
 
-            Logger.LogInfo($"云端缺失 {missing.Count} 个本地存档，开始补传...");
-
-            var semaphore = new SemaphoreSlim(Math.Max(1, configMaxParallelUploadCount.Value));
-            var tasks = missing.Select(async info =>
-            {
-                await semaphore.WaitAsync().ConfigureAwait(false);
-                try
-                {
-                    // 游戏启动初期文件可能仍在写入，确认稳定后再传
-                    if (!await WaitForFileReady(info.FullName, CancellationToken.None).ConfigureAwait(false))
-                    {
-                        Logger.LogWarning($"文件仍在写入，跳过补传: {info.Name}");
-                        return;
-                    }
-
-                    if (await UploadSingleFile(info.FullName).ConfigureAwait(false))
-                    {
-                        // 记入快照，避免运行期循环把同一文件再传一遍
-                        _fileLastWriteTimes[info.Name] = File.GetLastWriteTimeUtc(info.FullName);
-                        Logger.LogInfo($"云端缺失，已补传存档: {info.Name}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.LogError($"补传存档失败 [{info.Name}]: {FormatException(ex)}");
-                }
-                finally
-                {
-                    semaphore.Release();
-                }
-            }).ToList();
-
-            await Task.WhenAll(tasks).ConfigureAwait(false);
-            Logger.LogInfo("补传阶段完成");
+            Logger.LogInfo($"云端缺失 {missing.Count} 个本地存档，转交后台上传进程...");
+            HandOffToBackgroundUploader(missing);
         }
 
         /// <summary>

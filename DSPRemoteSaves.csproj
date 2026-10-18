@@ -56,6 +56,7 @@
       <Private>True</Private>
     </Reference>
     <Reference Include="System.Numerics" />
+    <Reference Include="System.Management" />
     <Reference Include="UnityEngine">
       <HintPath>$(ManagedDir)\UnityEngine.dll</HintPath>
       <Private>False</Private>

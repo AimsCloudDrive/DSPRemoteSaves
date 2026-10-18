@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -13,152 +14,96 @@ using DSPRemoteSaves;
 namespace DSPSavesUploader
 {
     /// <summary>
-    /// DSP 云存档后台上传器：游戏退出时由插件启动的独立进程，
-    /// 把未完成的存档清单继续上传到服务器。游戏退出不影响本进程。
+    /// DSP 云存档后台上传器：由插件在「启动补传」和「退出续传」时派发的独立进程。
+    /// 与游戏进程树完全独立（经 WMI 创建），游戏退出不影响上传。
     ///
-    /// 用法：DSPSavesUploader.exe --task &lt;pending.json&gt;
-    /// pending.json：{"server":"...","userName":"...","password":"...","logPath":"...","files":["...","..."]}
-    /// 任务结束后该文件会被删除，日志写入 logPath。
+    /// 任务发现（二选一）：
+    ///   1. --task &lt;pending.json&gt;   指定单个清单（兼容旧调用）
+    ///   2. 无参数                    扫描约定目录（exe 同目录 / DSPRemoteSaves 子目录）下全部
+    ///                                pending-upload-*.json，处理完一轮后继续等待新清单，
+    ///                                直到 20 秒内无新任务才退出。
+    /// 清单格式：{"server":"http://host:9999","userName":"..","password":"..","files":["..",".."]}
     /// </summary>
     internal static class Program
     {
-        private const int OverallTimeoutMinutes = 30;   // 整体自退保护
-        private const int MaxAttemptsPerFile = 2;       // 单文件尝试次数
+        private const int MaxAttemptsPerFile = 2;
+        private static readonly TimeSpan NewTaskWait = TimeSpan.FromSeconds(20);
         private static Mutex _singleInstance;
-
         private static TextWriter _log = Console.Out;
         private static HttpClient _http;
 
         private static int Main(string[] args)
         {
-            // 单实例：前一个实例还在上传时等待其结束，避免同文件并发产生多余版本
+            // 单实例：避免多个上传器并发上传同一文件；新实例会等待旧实例结束再接手剩余清单
             _singleInstance = new Mutex(true, @"Global\DSPSavesUploader", out var createdNew);
             if (!createdNew)
             {
+                Log("已有上传器实例在运行，等待其结束...");
                 try
                 {
-                    if (!_singleInstance.WaitOne(TimeSpan.FromMinutes(10)))
+                    if (!_singleInstance.WaitOne(TimeSpan.FromMinutes(120)))
                     {
-                        return 3; // 等待超时，放弃（下次游戏退出会重新派发）
+                        Log("等待超时，本次退出（清单保留，下次派发时继续）");
+                        return 3;
                     }
                 }
                 catch (AbandonedMutexException) { /* 上个实例异常退出，接管 */ }
             }
 
             try { Console.OutputEncoding = Encoding.UTF8; } catch { }
-            var overall = Stopwatch.StartNew();
+
             try
             {
-                // 自检：SM3/SM4 标准向量 + 信封输出合法性（用于排查运行时差异）
-            if (args.Any(a => a == "--selftest"))
-            {
-                var sm3 = SmCrypto.BytesToHex(SmCrypto.Sm3(Encoding.UTF8.GetBytes("abc")));
-                var sm4 = SmCrypto.Sm4EcbEncryptHex(
-                    "0123456789abcdeffedcba9876543210",
-                    SmCrypto.HexToBytes("0123456789abcdeffedcba9876543210"));
-                Log("SM3(abc)=" + sm3 + " " + (sm3 == "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0" ? "OK" : "MISMATCH"));
-                Log("SM4[0..16]=" + sm4.Substring(0, 32) + " " + (sm4.StartsWith("681edf34d206965e86b3e94f536e4246") ? "OK" : "MISMATCH"));
-                var pk = "04c9c5e4a23c2fe03d992298c0c29ffbb6b7b73bcce48275ee93b71b755b697200067529a96d4bd85e7951477ab5f97b7506351d719c91b35db5d876e11935b76b";
-
-                System.Reflection.FieldInfo sboxField = typeof(SmCrypto).GetField("Sm4Sbox",
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-                Func<string> dumpSbox = () =>
+                // 自检：SM3/SM4 标准向量（排查运行环境差异用）
+                if (args.Any(a => a == "--selftest"))
                 {
-                    var arr = (byte[])sboxField.GetValue(null);
-                    var sb = new StringBuilder();
-                    for (int i = 0; i < 8; i++) sb.Append(arr[i].ToString("x2"));
-                    return sb.ToString();
-                };
-                Log("Sbox BEFORE sm4 = " + dumpSbox());
-
-                var sk2 = SmCrypto.Sm4EcbEncryptHex(
-                    "0123456789abcdeffedcba9876543210",
-                    SmCrypto.HexToBytes("0123456789abcdeffedcba9876543210"));
-                Log("Sbox AFTER  sm4 = " + dumpSbox() + "  sm4=" + sk2.Substring(0, 32));
-
-                SmCrypto.SealPassword(pk, "test-password", out var sk, out var cp);
-                Log("Sbox AFTER  seal= " + dumpSbox());
-                Log("smkey len=" + sk.Length + " hex=" + IsHex(sk));
-                Log("cipher len=" + cp.Length + " hex=" + IsHex(cp) + " sample=" + cp.Substring(0, Math.Min(32, cp.Length)));
-                return 0;
-            }
-
-            var taskPath = GetArgValue(args, "--task");
-                if (string.IsNullOrEmpty(taskPath) || !File.Exists(taskPath))
-                {
-                    Console.WriteLine("用法: DSPSavesUploader.exe --task <pending.json>");
-                    return 1;
+                    var sm3 = SmCrypto.BytesToHex(SmCrypto.Sm3(Encoding.UTF8.GetBytes("abc")));
+                    var sm4 = SmCrypto.Sm4EcbEncryptHex(
+                        "0123456789abcdeffedcba9876543210",
+                        SmCrypto.HexToBytes("0123456789abcdeffedcba9876543210"));
+                    Log("SM3(abc)=" + sm3 + (sm3 == "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0" ? " OK" : " MISMATCH"));
+                    Log("SM4[0..16]=" + sm4.Substring(0, 32) + (sm4.StartsWith("681edf34d206965e86b3e94f536e4246") ? " OK" : " MISMATCH"));
+                    return 0;
                 }
 
-                var json = File.ReadAllText(taskPath);
-                var server = ExtractString(json, "server");
-                var user = ExtractString(json, "userName");
-                var password = ExtractString(json, "password");
-                var logPath = ExtractString(json, "logPath");
-                var files = ExtractStringArray(json, "files");
+                var baseDir = AppContext.BaseDirectory;
+                var pendingDir = Path.Combine(baseDir, "DSPRemoteSaves");
+                var searchDirs = new[] { pendingDir, baseDir };
 
-                if (!string.IsNullOrEmpty(logPath))
+                // 日志固定写在上传器旁的 DSPRemoteSaves/uploader.log
+                try
                 {
-                    try
-                    {
-                        var dir = Path.GetDirectoryName(Path.GetFullPath(logPath));
-                        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                        var writer = new StreamWriter(logPath, append: true) { AutoFlush = true };
-                        _log = writer;
-                    }
-                    catch { /* 日志不可用时继续用控制台 */ }
+                    Directory.CreateDirectory(pendingDir);
+                    _log = new StreamWriter(Path.Combine(pendingDir, "uploader.log"), true) { AutoFlush = true };
                 }
+                catch { /* 日志不可用时继续用控制台 */ }
 
-                if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(user) || files.Count == 0)
-                {
-                    Log("任务清单不完整，放弃");
-                    return 1;
-                }
-
-                Log($"===== 后台上传器启动 pid={Process.GetCurrentProcess().Id} 文件数={files.Count} =====");
+                Log($"===== 后台上传器启动 pid={Process.GetCurrentProcess().Id} =====");
 
                 using (_http = new HttpClient { Timeout = TimeSpan.FromMinutes(15) })
                 {
-                    // task 里的 server 与插件配置同格式（不带路径），与插件一样自动拼接 API 前缀
-                    server = server.TrimEnd('/') + "/dsp.saves/api/";
-                    var publicKey = EnsurePublicKey(server).GetAwaiter().GetResult();
+                    var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-                    var ok = 0;
-                    foreach (var file in files)
+                    while (true)
                     {
-                        if (overall.Elapsed > TimeSpan.FromMinutes(OverallTimeoutMinutes))
+                        var batch = CollectPendingTasks(args, searchDirs, processed);
+                        if (batch.Count == 0)
                         {
-                            Log("达到整体时限，剩余文件将由下次游戏退出重新派发");
-                            break;
-                        }
-                        if (!File.Exists(file))
-                        {
-                            Log($"文件不存在，跳过: {file}");
-                            continue;
+                            Log("队列已清空，上传器退出");
+                            return 0;
                         }
 
-                        var done = false;
-                        for (var attempt = 1; attempt <= MaxAttemptsPerFile && !done; attempt++)
+                        RunBatch(batch, processed);
+
+                        // 处理完一批后等待新清单（游戏正常退出时插件会再派发），20 秒无新任务才退出
+                        var more = WaitForNewTasks(args, searchDirs, processed);
+                        if (more.Count == 0)
                         {
-                            try
-                            {
-                                UploadOne(server, user, password, publicKey, file).GetAwaiter().GetResult();
-                                done = true;
-                                ok++;
-                            }
-                            catch (Exception ex)
-                            {
-                                Log($"上传失败（第 {attempt}/{MaxAttemptsPerFile} 次）[{Path.GetFileName(file)}]: {ex.Message}");
-                                if (attempt < MaxAttemptsPerFile) Thread.Sleep(3000);
-                            }
+                            Log("队列已清空，上传器退出");
+                            return 0;
                         }
                     }
-
-                    Log($"===== 后台上传结束 成功 {ok}/{files.Count} 用时 {overall.Elapsed.TotalSeconds:0}s =====");
                 }
-
-                try { File.Delete(taskPath); } catch { /* 任务文件删除失败无碍 */ }
-                return 0;
             }
             catch (Exception ex)
             {
@@ -170,6 +115,118 @@ namespace DSPSavesUploader
                 _singleInstance.ReleaseMutex();
                 _singleInstance.Dispose();
                 if (_log != Console.Out) _log.Dispose();
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 任务发现与调度
+        // ------------------------------------------------------------------
+
+        /// <summary>收集尚未处理的清单：--task 优先，否则扫描约定目录。</summary>
+        private static List<string> CollectPendingTasks(string[] args, string[] searchDirs, HashSet<string> processed)
+        {
+            var result = new List<string>();
+            var taskArg = GetArgValue(args, "--task");
+            if (!string.IsNullOrEmpty(taskArg))
+            {
+                var full = Path.GetFullPath(taskArg);
+                if (File.Exists(full) && processed.Add(full)) result.Add(full);
+                return result;
+            }
+
+            foreach (var dir in searchDirs)
+            {
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
+                foreach (var f in Directory.GetFiles(dir, "pending-upload-*.json"))
+                {
+                    var full = Path.GetFullPath(f);
+                    if (processed.Add(full)) result.Add(full);
+                }
+            }
+            return result;
+        }
+
+        /// <summary>最多等 NewTaskWait 时间轮询新清单，有则返回（并计入 processed）。</summary>
+        private static List<string> WaitForNewTasks(string[] args, string[] searchDirs, HashSet<string> processed)
+        {
+            var deadline = DateTime.UtcNow + NewTaskWait;
+            while (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(2000);
+                var more = CollectPendingTasks(args, searchDirs, processed);
+                if (more.Count > 0) return more;
+            }
+            return new List<string>();
+        }
+
+        /// <summary>处理一批清单：逐清单读文件列表并上传，成功后删除清单文件。</summary>
+        private static void RunBatch(List<string> taskFiles, HashSet<string> processed)
+        {
+            var batchStopwatch = Stopwatch.StartNew();
+            foreach (var taskPath in taskFiles)
+            {
+                try
+                {
+                    var json = File.ReadAllText(taskPath);
+                    var server = ExtractString(json, "server");
+                    var user = ExtractString(json, "userName");
+                    var password = ExtractString(json, "password");
+                    var files = ExtractStringArray(json, "files");
+
+                    if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(user) || files.Count == 0)
+                    {
+                        Log($"任务清单不完整，跳过: {Path.GetFileName(taskPath)}");
+                        SafeDelete(taskPath);
+                        continue;
+                    }
+
+                    Log($"处理清单 {Path.GetFileName(taskPath)}（{files.Count} 个文件）");
+
+                    // server 与插件配置同格式（不带路径），与插件一样自动拼接 API 前缀
+                    var serverUrl = server.TrimEnd('/') + "/dsp.saves/api/";
+                    var pk = EnsurePublicKey(serverUrl).GetAwaiter().GetResult();
+
+                    var ok = 0;
+                    foreach (var file in files)
+                    {
+                        if (!File.Exists(file))
+                        {
+                            Log($"文件不存在，跳过: {file}");
+                            continue;
+                        }
+
+                        var done = false;
+                        for (var attempt = 1; attempt <= MaxAttemptsPerFile && !done; attempt++)
+                        {
+                            try
+                            {
+                                // 文件可能仍被游戏写入：确认稳定后再传
+                                if (!FileReady(file))
+                                {
+                                    Log($"文件仍在写入，本文件跳过（下次游戏退出会重新派发）: {Path.GetFileName(file)}");
+                                    break;
+                                }
+
+                                UploadOne(serverUrl, user, password, pk, file).GetAwaiter().GetResult();
+                                done = true;
+                                ok++;
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"上传失败（第 {attempt}/{MaxAttemptsPerFile} 次）[{Path.GetFileName(file)}]: {ex.Message}");
+                                if (attempt < MaxAttemptsPerFile) Thread.Sleep(3000);
+                            }
+                        }
+                    }
+
+                    SafeDelete(taskPath);
+                    Log($"清单处理完成：成功 {ok}/{files.Count}（本批累计 {batchStopwatch.Elapsed.TotalMinutes:0.0} 分钟）");
+                }
+                catch (Exception ex)
+                {
+                    // 清单文件保留，下次派发时重试
+                    Log($"处理清单异常（文件保留待重试）: {Path.GetFileName(taskPath)} → {ex.Message}");
+                }
             }
         }
 
@@ -187,15 +244,14 @@ namespace DSPSavesUploader
         {
             var resp = await _http.GetAsync(baseUrl + "crypto/public-key").ConfigureAwait(false);
             var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
-            var code = ExtractLong(body, "code");
-            if (code != 0) throw new Exception("获取公钥失败: " + body);
+            if (ExtractLong(body, "code") != 0) throw new Exception("获取公钥失败: " + Trim(body, 200));
             var info = new PublicKeyInfo
             {
                 KeyId = ExtractString(body, "keyId"),
                 PublicKey = ExtractString(body, "publicKey"),
             };
             if (string.IsNullOrEmpty(info.KeyId) || string.IsNullOrEmpty(info.PublicKey))
-                throw new Exception("公钥响应格式异常: " + body);
+                throw new Exception("公钥响应格式异常: " + Trim(body, 200));
             Log($"已获取国密公钥 keyId={info.KeyId}");
             return info;
         }
@@ -219,13 +275,13 @@ namespace DSPSavesUploader
             var uploadToken = ExtractString(initResp, "uploadToken");
             if (string.IsNullOrEmpty(fileId) || string.IsNullOrEmpty(uploadToken) || chunkSize <= 0)
                 throw new Exception("init 响应缺少关键字段: " + Trim(initResp, 300));
-            Log($"init ok file={fileName} size={size} chunks={totalChunks} (chunkSize={chunkSize})");
+            Log($"init ok file={fileName} size={size} chunks={totalChunks}");
 
             // 2) 分片（uploadToken 头，流式读取避免大文件占内存）
             using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
                 var buffer = new byte[chunkSize];
-                var progressEvery = Math.Max(1, totalChunks / 8);
+                var progressEvery = Math.Max(1, (int)totalChunks / 8);
                 for (long index = 0; index < totalChunks; index++)
                 {
                     var read = fs.Read(buffer, 0, buffer.Length);
@@ -242,10 +298,10 @@ namespace DSPSavesUploader
                             var text = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                             if (!resp.IsSuccessStatusCode || ExtractLong(text, "code") != 0)
                                 throw new Exception($"chunk {index} 失败: HTTP {(int)resp.StatusCode} {Trim(text, 200)}");
-                            if ((index + 1) % progressEvery == 0 || index + 1 == totalChunks)
-                                Log($"进度 {fileName} 分片 {index + 1}/{totalChunks}");
                         }
                     }
+                    if ((index + 1) % progressEvery == 0 || index + 1 == totalChunks)
+                        Log($"进度 {fileName} 分片 {index + 1}/{totalChunks}");
                 }
             }
 
@@ -277,6 +333,23 @@ namespace DSPSavesUploader
             return (smkey, cipher);
         }
 
+        /// <summary>采样两次文件大小与修改时间，稳定（未被游戏写入）才返回 true。</summary>
+        private static bool FileReady(string path)
+        {
+            for (var i = 0; i < 2; i++)
+            {
+                try
+                {
+                    var fi1 = new FileInfo(path);
+                    Thread.Sleep(800);
+                    var fi2 = new FileInfo(path);
+                    return fi1.Length == fi2.Length && fi1.LastWriteTimeUtc == fi2.LastWriteTimeUtc;
+                }
+                catch (IOException) { Thread.Sleep(500); }
+            }
+            return false;
+        }
+
         // ------------------------------------------------------------------
         // 工具
         // ------------------------------------------------------------------
@@ -286,6 +359,11 @@ namespace DSPSavesUploader
             var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}";
             try { _log.WriteLine(line); } catch { }
             Console.WriteLine(line);
+        }
+
+        private static void SafeDelete(string path)
+        {
+            try { File.Delete(path); } catch { /* 删除失败无碍，processed 集合已防重复 */ }
         }
 
         private static string GetArgValue(string[] args, string name)
@@ -344,17 +422,6 @@ namespace DSPSavesUploader
                 }
             }
             return sb.ToString();
-        }
-
-        private static string IsHex(string s)
-        {
-            if (string.IsNullOrEmpty(s) || s.Length % 2 != 0) return "BAD(length=" + (s?.Length ?? -1) + ")";
-            foreach (var c in s)
-            {
-                var ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-                if (!ok) return "BAD(char='" + c + "')";
-            }
-            return "OK";
         }
 
         private static string Trim(string s, int max)
